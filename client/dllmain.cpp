@@ -1,66 +1,41 @@
+#include "NativeBridge.h"
 #include "pch.h"
-#include "script.h"
-#include <iostream>
-#include "DebugExecClient.h"
+
 #include <windows.h>
-#include <thread>
+
 #include <atomic>
-#include <string>
-#include <sstream>
-#include <vector>
-#include <regex>
 #include <filesystem>
-#include "pugixml\pugixml.hpp"
-#include <unordered_set>
+#include <iostream>
+#include <mutex>
+#include <regex>
+#include <sstream>
+#include <string>
+#include <thread>
 #include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "pugixml\pugixml.hpp"
+
 #define ASIO_STANDALONE
 #include <asio.hpp>
+
 namespace fs = std::filesystem;
-using namespace w3mp;
 
-static DebugExecClient g_client;
-static std::thread g_poll;
-static std::thread g_game;
-
+static std::thread g_sender;
+static std::thread g_receiver;
 static std::string username = "Player";
-static std::atomic<int> g_localPlayerId{ 0 };
 static std::string ip = "46.62.255.79";
 static std::string port = "40000";
-
 static HANDLE g_initThread = NULL;
+static std::atomic<int> g_localPlayerId{0};
+static std::atomic<bool> g_shutdown{false};
+static std::atomic<bool> g_run{false};
 
-asio::io_context io;
-asio::ip::udp::resolver resolver(io);
-asio::ip::udp::socket theSocket(io);
-asio::ip::udp::endpoint serverEndpoint;
-
-static std::atomic<bool> g_usernameTaken{ false };
-static std::atomic<bool> g_banned{ false };
-static std::atomic<bool> g_notWhitelisted{ false };
-static std::atomic<bool> g_kicked{ false };
-static std::atomic<bool> g_shutdown{ false };
-static std::atomic<bool> g_run{ false };
-
-struct ExecJob {
-	std::string code, tag;
-	int timeoutMs;
-};
-
-static std::mutex g_qMu;
-static std::vector<ExecJob> g_jobs;
-
-static int g_sequenceSeed = static_cast<int>(((GetTickCount64() / 20ULL) % 1000000000ULL) + 1ULL);
-static int g_movementSequence = g_sequenceSeed;
-static int g_update1Sequence = g_sequenceSeed;
-static int g_update2Sequence = g_sequenceSeed;
-static int g_update3Sequence = g_sequenceSeed;
-static int g_update4Sequence = g_sequenceSeed;
-
-fs::path getExecutablePath() {
-	char buffer[MAX_PATH];
-	GetModuleFileNameA(NULL, buffer, MAX_PATH);
-	return fs::path(buffer).parent_path().parent_path();
-}
+static asio::io_context io;
+static asio::ip::udp::resolver resolver(io);
+static asio::ip::udp::socket theSocket(io);
+static asio::ip::udp::endpoint serverEndpoint;
 
 struct ParsedHalves
 {
@@ -68,7 +43,44 @@ struct ParsedHalves
 	std::vector<std::string> second;
 };
 
-static ParsedHalves ParseValuesSplitHalf(const std::string& input)
+struct RemotePlayerChunks
+{
+	std::string username;
+
+	std::vector<std::string> update1A;
+	std::vector<std::string> update1B;
+	std::vector<std::string> update2A;
+	std::vector<std::string> update2B;
+
+	std::vector<std::string> lastUpdate1;
+	std::vector<std::string> lastUpdate2;
+	std::vector<std::string> lastUpdate3;
+	std::vector<std::string> lastUpdate4;
+
+	int update1ASequence = 0;
+	int update1BSequence = 0;
+
+	int update1AMovementSequence = 0;
+	int update1BMovementSequence = 0;
+
+	int update2ASequence = 0;
+	int update2BSequence = 0;
+
+	int lastPushed1Sequence = 0;
+	int lastPushed2Sequence = 0;
+};
+
+static std::mutex remoteMu;
+static std::unordered_map<int, RemotePlayerChunks> remotePlayers;
+
+static fs::path getExecutablePath()
+{
+	char buffer[MAX_PATH]{};
+	GetModuleFileNameA(NULL, buffer, MAX_PATH);
+	return fs::path(buffer).parent_path().parent_path();
+}
+
+static ParsedHalves ParseValuesSplitHalf(const std::string &input)
 {
 	static const std::string kStartMarker = "_s";
 	static const std::string kEndMarker = "_e";
@@ -76,9 +88,8 @@ static ParsedHalves ParseValuesSplitHalf(const std::string& input)
 
 	std::istringstream iss(input);
 	std::string word;
-
 	ParsedHalves out;
-	std::vector<std::string>* current = &out.first;
+	std::vector<std::string> *current = &out.first;
 
 	if (!(iss >> word))
 		return out;
@@ -129,52 +140,45 @@ static ParsedHalves ParseValuesSplitHalf(const std::string& input)
 	}
 
 	if (inBlock && !blockAccum.empty())
-	{
 		current->push_back(blockAccum);
-	}
 
 	return out;
 }
 
-void PostExec(const std::string& code, const std::string& tag = "", int to = 300) {
-	if (!g_run.load())
-		return;
-
-	std::lock_guard<std::mutex> lk(g_qMu);
-	g_jobs.push_back({ code, tag, to });
-}
-
-static std::string EscapeField(const std::string& s)
+static std::string EscapeField(const std::string &s)
 {
 	std::string out;
 	out.reserve(s.size());
 
 	for (char c : s)
 	{
-		if (c == '\\') out += "\\\\";
-		else if (c == '\t') out += "\\t";
-		else if (c == '\n') out += "\\n";
-		else if (c == '\r') out += "\\r";
-		else out += c;
+		if (c == '\\')
+			out += "\\\\";
+		else if (c == '\t')
+			out += "\\t";
+		else if (c == '\n')
+			out += "\\n";
+		else if (c == '\r')
+			out += "\\r";
+		else
+			out += c;
 	}
 
 	return out;
 }
 
-static std::string BuildPacket(const std::string& opcode, const std::string& id, const std::vector<std::string>& fields)
+static std::string BuildPacket(const std::string &opcode, const std::string &id, const std::vector<std::string> &fields)
 {
 	std::string packet = opcode + "\t" + id;
-
-	for (const auto& f : fields)
+	for (const auto &f : fields)
 	{
 		packet += "\t";
 		packet += EscapeField(f);
 	}
-
 	return packet;
 }
 
-static std::vector<std::string> SplitTabs(const std::string& s)
+static std::vector<std::string> SplitTabs(const std::string &s)
 {
 	std::vector<std::string> parts;
 	std::string cur;
@@ -182,22 +186,31 @@ static std::vector<std::string> SplitTabs(const std::string& s)
 
 	for (char c : s)
 	{
-		if (esc) {
-			if (c == 't') cur += '\t';
-			else if (c == 'n') cur += '\n';
-			else if (c == 'r') cur += '\r';
-			else if (c == '\\') cur += '\\';
-			else cur += c;
+		if (esc)
+		{
+			if (c == 't')
+				cur += '\t';
+			else if (c == 'n')
+				cur += '\n';
+			else if (c == 'r')
+				cur += '\r';
+			else if (c == '\\')
+				cur += '\\';
+			else
+				cur += c;
 			esc = false;
 		}
-		else if (c == '\\') {
+		else if (c == '\\')
+		{
 			esc = true;
 		}
-		else if (c == '\t') {
+		else if (c == '\t')
+		{
 			parts.push_back(cur);
 			cur.clear();
 		}
-		else {
+		else
+		{
 			cur += c;
 		}
 	}
@@ -206,334 +219,39 @@ static std::vector<std::string> SplitTabs(const std::string& s)
 	return parts;
 }
 
-static std::string EscapeExecQuoted(const std::string& s, char quote)
+static bool ParsePositiveInt(const std::string &text, int &value)
 {
-	std::string out;
-	out.reserve(s.size() + 8);
-
-	for (char c : s)
+	try
 	{
-		if (c == '\\')
-			out += "\\\\";
-		else if (c == quote)
-		{
-			out += '\\';
-			out += c;
-		}
-		else if (c == '\n')
-			out += "\\n";
-		else if (c == '\r')
-			out += "\\r";
-		else if (c == '\t')
-			out += "\\t";
-		else
-			out += c;
+		value = std::stoi(text);
+		return value > 0;
 	}
-
-	return out;
-}
-
-static void AppendExecField(std::string& code, const std::string& value)
-{
-	code += ", ";
-
-	if (value.find_first_of(" \t\r\n") != std::string::npos)
+	catch (...)
 	{
-		code += "'";
-		code += EscapeExecQuoted(value, '\'');
-		code += "'";
-	}
-	else
-	{
-		code += value;
+		value = 0;
+		return false;
 	}
 }
 
-static int NextSequence(int& value)
+static bool ExtractMovementPrefix(const ParsedHalves &halves, std::vector<std::string> &movement)
 {
-    if (value <= 0 || value >= 2000000000)
-        value = 1;
-    else
-        value++;
-    return value;
+	if (halves.first.size() < 7)
+		return false;
+	movement.assign(halves.first.begin(), halves.first.begin() + 7);
+	return true;
 }
 
-static bool ParsePositiveInt(const std::string& text, int& value)
+static bool RemoveMovementPrefix(ParsedHalves &halves, std::vector<std::string> &movement)
 {
-    try
-    {
-        value = std::stoi(text);
-        return value > 0;
-    }
-    catch (...)
-    {
-        value = 0;
-        return false;
-    }
-}
-
-static bool ExtractMovementPrefix(const ParsedHalves& halves, std::vector<std::string>& movement)
-{
-    if (halves.first.size() < 7)
-        return false;
-
-    movement.assign(halves.first.begin(), halves.first.begin() + 7);
-    return true;
-}
-
-static bool RemoveMovementPrefix(ParsedHalves& halves, std::vector<std::string>& movement)
-{
-    if (!ExtractMovementPrefix(halves, movement))
-        return false;
-
-    halves.first.erase(halves.first.begin(), halves.first.begin() + 7);
-    return true;
-}
-
-static void SendUdpPacket(const std::string& packet, const char* label)
-{
-    try
-    {
-        theSocket.send(asio::buffer(packet));
-    }
-    catch (const std::exception& e)
-    {
-        std::cout << "Send error (" << label << "): " << e.what() << "\n";
-    }
-}
-
-static void SendMovementPacket(const std::string& packetId, const std::vector<std::string>& movement, int movementSequence)
-{
-    if (movement.size() < 7 || movementSequence <= 0)
-        return;
-
-    std::vector<std::string> fields;
-    fields.reserve(8);
-    fields.push_back(std::to_string(movementSequence));
-    fields.insert(fields.end(), movement.begin(), movement.begin() + 7);
-    SendUdpPacket(BuildPacket("MOVE", packetId, fields), "MOVE");
-}
-
-static void pushPlayer1(
-    int playerId,
-    const std::string& username,
-    int movementSequence,
-    const std::vector<std::string>& update1A,
-    const std::vector<std::string>& update1B)
-{
-    if (playerId <= 0 || username.empty() || movementSequence <= 0)
-        return;
-
-    std::vector<std::string> fields;
-    fields.reserve(update1A.size() + update1B.size());
-    fields.insert(fields.end(), update1A.begin(), update1A.end());
-    fields.insert(fields.end(), update1B.begin(), update1B.end());
-
-    if (fields.empty())
-        return;
-
-    std::string playerIdStr = std::to_string(playerId);
-    std::string code = "wo_update(" + playerIdStr + ", \"" + EscapeExecQuoted(username, '"') + "\", " + std::to_string(movementSequence);
-
-    for (const auto& field : fields)
-        AppendExecField(code, field);
-
-    code += ")";
-    g_client.ExecNoWaitLatest("wo1:" + playerIdStr, code);
-}
-
-static void pushPlayer2(
-    int playerId,
-    const std::string& username,
-    const std::vector<std::string>& update2A,
-    const std::vector<std::string>& update2B)
-{
-    if (playerId <= 0 || username.empty())
-        return;
-
-    std::vector<std::string> fields;
-    fields.reserve(update2A.size() + update2B.size());
-    fields.insert(fields.end(), update2A.begin(), update2A.end());
-    fields.insert(fields.end(), update2B.begin(), update2B.end());
-
-    if (fields.empty())
-        return;
-
-    std::string playerIdStr = std::to_string(playerId);
-    std::string code = "wo_update2(" + playerIdStr + ", \"" + EscapeExecQuoted(username, '"') + "\"";
-
-    for (const auto& field : fields)
-        AppendExecField(code, field);
-
-    code += ")";
-    g_client.ExecNoWaitLatest("wo2:" + playerIdStr, code);
-}
-
-static void pushPlayerMovement(int playerId, const std::string& username, const std::vector<std::string>& movement)
-{
-    if (playerId <= 0 || username.empty() || movement.size() < 8)
-        return;
-
-    int movementSequence = 0;
-    if (!ParsePositiveInt(movement[0], movementSequence))
-        return;
-
-    std::string playerIdStr = std::to_string(playerId);
-    std::string code = "wo_move(" + playerIdStr + ", \"" + EscapeExecQuoted(username, '"') + "\", " + std::to_string(movementSequence);
-
-    for (size_t i = 1; i < 8; ++i)
-        AppendExecField(code, movement[i]);
-
-    code += ")";
-    g_client.ExecPriorityLatest("move:" + playerIdStr, code);
-}
-
-static void pushPlayer3(int playerId, const std::string& username, const std::vector<std::string>& update3)
-{
-	if (playerId <= 0 || username.empty() || update3.size() < 6)
-		return;
-
-	const std::string& outgoingGwentTo = update3[0];
-	const std::string& outgoingGwentRequest = update3[1];
-	const std::string& outgoingGwentBet = update3[2];
-	const std::string& outgoingGwentSeed = update3[3];
-	const std::string& lastGwentAction = update3[4];
-	const std::string& lastGwentActionTime = update3[5];
-
-	std::string gwentData;
-	for (size_t i = 6; i < update3.size(); ++i)
-	{
-		if (!gwentData.empty())
-			gwentData += " ";
-
-		gwentData += update3[i];
-	}
-
-	std::string playerIdStr = std::to_string(playerId);
-
-	std::string code3 = "wo_update3(";
-	code3 += playerIdStr;
-
-	code3 += ", \"";
-	code3 += EscapeExecQuoted(username, '"');
-	code3 += "\"";
-
-	code3 += ", \"";
-	code3 += EscapeExecQuoted(outgoingGwentTo, '"');
-	code3 += "\"";
-
-	code3 += ", ";
-	code3 += outgoingGwentRequest;
-
-	code3 += ", ";
-	code3 += outgoingGwentBet;
-
-	code3 += ", ";
-	code3 += outgoingGwentSeed;
-
-	code3 += ", \"";
-	code3 += EscapeExecQuoted(lastGwentAction, '"');
-	code3 += "\"";
-
-	code3 += ", ";
-	code3 += lastGwentActionTime;
-
-	code3 += ", \"";
-	code3 += EscapeExecQuoted(gwentData, '"');
-	code3 += "\")";
-
-	g_client.ExecNoWaitLatest("wo3:" + playerIdStr, code3);
-}
-
-static void pushPlayer4(int playerId, const std::string& username, const std::vector<std::string>& update4)
-{
-	if (playerId <= 0 || username.empty() || update4.size() < 16)
-		return;
-
-	const std::string& inParty = update4[0];
-	const std::string& joinedParty = update4[1];
-	const std::string& weather = update4[2];
-	const std::string& day = update4[3];
-	const std::string& hour = update4[4];
-	const std::string& minute = update4[5];
-	const std::string& second = update4[6];
-	const std::string& lastDialogIndex = update4[7];
-	const std::string& lastDialogCount = update4[8];
-	const std::string& dialogChoices = update4[9];
-	const std::string& dialogChoicesActive = update4[10];
-	const std::string& armorDye = update4[11];
-	const std::string& gloveDye = update4[12];
-	const std::string& pantDye = update4[13];
-	const std::string& bootDye = update4[14];
-	const std::string& health = update4[15];
-
-	std::string playerIdStr = std::to_string(playerId);
-
-	std::string code4 = "wo_update4(";
-	code4 += playerIdStr;
-
-	code4 += ", \"";
-	code4 += EscapeExecQuoted(username, '"');
-	code4 += "\"";
-
-	code4 += ", ";
-	code4 += inParty;
-
-	code4 += ", \"";
-	code4 += EscapeExecQuoted(joinedParty, '"');
-	code4 += "\"";
-
-	code4 += ", \"";
-	code4 += EscapeExecQuoted(weather, '"');
-	code4 += "\"";
-
-	code4 += ", ";
-	code4 += day;
-
-	code4 += ", ";
-	code4 += hour;
-
-	code4 += ", ";
-	code4 += minute;
-
-	code4 += ", ";
-	code4 += second;
-
-	code4 += ", ";
-	code4 += lastDialogIndex;
-
-	code4 += ", ";
-	code4 += lastDialogCount;
-
-	code4 += ", \"";
-	code4 += EscapeExecQuoted(dialogChoices, '"');
-	code4 += "\"";
-
-	code4 += ", ";
-	code4 += dialogChoicesActive;
-
-	code4 += ", ";
-	code4 += armorDye;
-
-	code4 += ", ";
-	code4 += gloveDye;
-
-	code4 += ", ";
-	code4 += pantDye;
-
-	code4 += ", ";
-	code4 += bootDye;
-
-	code4 += ", ";
-	code4 += health;
-
-	code4 += ")";
-
-	g_client.ExecNoWaitLatest("wo4:" + playerIdStr, code4);
+	if (!ExtractMovementPrefix(halves, movement))
+		return false;
+	halves.first.erase(halves.first.begin(), halves.first.begin() + 7);
+	return true;
 }
 
 static void CloseOnlineSession()
 {
+	wo_native::SetConnected(false);
 	try
 	{
 		if (theSocket.is_open())
@@ -544,406 +262,668 @@ static void CloseOnlineSession()
 	}
 }
 
-struct RemotePlayerChunks
+static void SendUdpPacket(const std::string &packet, const char *label)
 {
-    std::string username;
+	if (!wo_native::IsConnected() || !theSocket.is_open())
+		return;
 
-    std::vector<std::string> update1A;
-    std::vector<std::string> update1B;
-    std::vector<std::string> update2A;
-    std::vector<std::string> update2B;
-
-    int update1ASequence = 0;
-    int update1BSequence = 0;
-    int update1AMovementSequence = 0;
-    int update1BMovementSequence = 0;
-    int update2ASequence = 0;
-    int update2BSequence = 0;
-    int lastPushed1Sequence = 0;
-    int lastPushed2Sequence = 0;
-    int lastPushed3Sequence = 0;
-    int lastPushed4Sequence = 0;
-};
-
-std::mutex remoteMu;
-std::unordered_map<int, RemotePlayerChunks> remotePlayers;
-
-static void HandleServerPacket(const std::string& msg)
-{
-    auto parts = SplitTabs(msg);
-    if (parts.empty())
-        return;
-
-    if (parts[0] == "ERROR")
-    {
-        if (parts.size() >= 2 && parts[1] == "USERNAME_TAKEN")
-        {
-            g_usernameTaken.store(true);
-            CloseOnlineSession();
-        }
-        else if (parts.size() >= 2 && parts[1] == "BANNED")
-        {
-            g_banned.store(true);
-            CloseOnlineSession();
-        }
-        else if (parts.size() >= 2 && parts[1] == "NOT_WHITELISTED")
-        {
-            g_notWhitelisted.store(true);
-            CloseOnlineSession();
-        }
-        return;
-    }
-
-    if (parts[0] == "KICK")
-    {
-        g_kicked.store(true);
-        CloseOnlineSession();
-        return;
-    }
-
-    const std::string& opcode = parts[0];
-    if (opcode != "MOVE" && opcode != "UPDATE1A" && opcode != "UPDATE1B" && opcode != "UPDATE2A" && opcode != "UPDATE2B" && opcode != "UPDATE3" && opcode != "UPDATE4")
-        return;
-
-    if (parts.size() < 3)
-        return;
-
-    int playerId = 0;
-    if (!ParsePositiveInt(parts[1], playerId))
-        return;
-
-    std::string playerUsername = parts[2];
-    if (playerUsername.empty())
-        return;
-
-    if (playerUsername == ::username)
-        g_localPlayerId.store(playerId);
-
-    std::vector<std::string> fields(parts.begin() + 3, parts.end());
-
-    if (opcode == "MOVE")
-    {
-        pushPlayerMovement(playerId, playerUsername, fields);
-        return;
-    }
-
-    if (fields.empty())
-        return;
-
-    int packetSequence = 0;
-    if (!ParsePositiveInt(fields[0], packetSequence))
-        return;
-    fields.erase(fields.begin());
-
-    if (opcode == "UPDATE3" || opcode == "UPDATE4")
-    {
-        bool shouldPush = false;
-        {
-            std::lock_guard<std::mutex> lk(remoteMu);
-            auto& rp = remotePlayers[playerId];
-            rp.username = playerUsername;
-
-            if (opcode == "UPDATE3" && packetSequence > rp.lastPushed3Sequence)
-            {
-                rp.lastPushed3Sequence = packetSequence;
-                shouldPush = true;
-            }
-            else if (opcode == "UPDATE4" && packetSequence > rp.lastPushed4Sequence)
-            {
-                rp.lastPushed4Sequence = packetSequence;
-                shouldPush = true;
-            }
-        }
-
-        if (!shouldPush)
-            return;
-
-        if (opcode == "UPDATE3")
-            pushPlayer3(playerId, playerUsername, fields);
-        else
-            pushPlayer4(playerId, playerUsername, fields);
-        return;
-    }
-
-    int movementSequence = 0;
-    if (opcode == "UPDATE1A" || opcode == "UPDATE1B")
-    {
-        if (fields.empty() || !ParsePositiveInt(fields[0], movementSequence))
-            return;
-        fields.erase(fields.begin());
-    }
-
-    bool push1 = false;
-    bool push2 = false;
-    int pushMovementSequence = 0;
-    std::vector<std::string> u1a;
-    std::vector<std::string> u1b;
-    std::vector<std::string> u2a;
-    std::vector<std::string> u2b;
-    std::string pushUsername;
-
-    {
-        std::lock_guard<std::mutex> lk(remoteMu);
-        auto& rp = remotePlayers[playerId];
-        rp.username = playerUsername;
-
-        if (opcode == "UPDATE1A" && packetSequence > rp.lastPushed1Sequence)
-        {
-            rp.update1A = std::move(fields);
-            rp.update1ASequence = packetSequence;
-            rp.update1AMovementSequence = movementSequence;
-        }
-        else if (opcode == "UPDATE1B" && packetSequence > rp.lastPushed1Sequence)
-        {
-            rp.update1B = std::move(fields);
-            rp.update1BSequence = packetSequence;
-            rp.update1BMovementSequence = movementSequence;
-        }
-        else if (opcode == "UPDATE2A" && packetSequence > rp.lastPushed2Sequence)
-        {
-            rp.update2A = std::move(fields);
-            rp.update2ASequence = packetSequence;
-        }
-        else if (opcode == "UPDATE2B" && packetSequence > rp.lastPushed2Sequence)
-        {
-            rp.update2B = std::move(fields);
-            rp.update2BSequence = packetSequence;
-        }
-
-        if (rp.update1ASequence > rp.lastPushed1Sequence && rp.update1ASequence == rp.update1BSequence && rp.update1AMovementSequence == rp.update1BMovementSequence)
-        {
-            rp.lastPushed1Sequence = rp.update1ASequence;
-            u1a = rp.update1A;
-            u1b = rp.update1B;
-            pushMovementSequence = rp.update1AMovementSequence;
-            pushUsername = rp.username;
-            push1 = true;
-        }
-
-        if (rp.update2ASequence > rp.lastPushed2Sequence && rp.update2ASequence == rp.update2BSequence)
-        {
-            rp.lastPushed2Sequence = rp.update2ASequence;
-            u2a = rp.update2A;
-            u2b = rp.update2B;
-            pushUsername = rp.username;
-            push2 = true;
-        }
-    }
-
-    if (push1)
-        pushPlayer1(playerId, pushUsername, pushMovementSequence, u1a, u1b);
-    if (push2)
-        pushPlayer2(playerId, pushUsername, u2a, u2b);
+	try
+	{
+		theSocket.send(asio::buffer(packet));
+	}
+	catch (const std::exception &e)
+	{
+		std::cout << "Send error (" << label << "): " << e.what() << "\n";
+	}
 }
 
-static std::string BuildLocalPacketId(int localPlayerId)
+static std::string BuildLocalPacketId()
 {
-    if (localPlayerId > 0)
-        return std::to_string(localPlayerId) + "\t" + EscapeField(username);
-    return EscapeField(username);
+	const int localPlayerId = g_localPlayerId.load();
+	if (localPlayerId > 0)
+		return std::to_string(localPlayerId) + "\t" + EscapeField(username);
+	return EscapeField(username);
 }
 
-static bool PollUpdate1(int localPlayerId, const std::string& packetId)
+static int g_movementSequence = static_cast<int>(((GetTickCount64() / 20ULL) % 1000000000ULL) + 1ULL);
+
+static int g_update1Sequence = static_cast<int>(((GetTickCount64() / 20ULL) % 1000000000ULL) + 1ULL);
+
+static int g_update2Sequence = static_cast<int>(((GetTickCount64() / 20ULL) % 1000000000ULL) + 1ULL);
+
+static constexpr int kSequenceSpan = 2000000000;
+
+static constexpr ULONGLONG kScriptStallThresholdMs = 750;
+static constexpr ULONGLONG kKeepaliveIntervalMs = 1000;
+
+static constexpr ULONGLONG kMenuTransitionGraceMs = 500;
+static constexpr size_t kClientInGameField = 7;
+static constexpr size_t kMenuNameField = 47;
+
+static std::vector<std::string> g_cachedMovement;
+static ParsedHalves g_cachedUpdate1;
+static bool g_haveCachedUpdate1 = false;
+static std::string g_presence = "none";
+static ULONGLONG g_lastScriptActivityTick = 0;
+static ULONGLONG g_lastKeepaliveTick = 0;
+static ULONGLONG g_menuTransitionDeadlineTick = 0;
+
+static void ResetTransportWatchdog()
 {
-    std::string out;
-    bool ok = g_client.ExecTagged("wo_get(" + std::to_string(localPlayerId) + ", \"" + EscapeExecQuoted(username, '"') + "\")", "wo", out, 500);
-    if (!ok)
-        return false;
-
-    ParsedHalves halves = ParseValuesSplitHalf(out);
-    std::vector<std::string> movement;
-    if (!ExtractMovementPrefix(halves, movement))
-        return false;
-
-    int movementSequence = NextSequence(g_movementSequence);
-    int updateSequence = NextSequence(g_update1Sequence);
-    SendMovementPacket(packetId, movement, movementSequence);
-
-    std::vector<std::string> first = halves.first;
-    std::vector<std::string> second = halves.second;
-    first.insert(first.begin(), std::to_string(movementSequence));
-    first.insert(first.begin(), std::to_string(updateSequence));
-    second.insert(second.begin(), std::to_string(movementSequence));
-    second.insert(second.begin(), std::to_string(updateSequence));
-
-    if (!halves.first.empty())
-        SendUdpPacket(BuildPacket("UPDATE1A", packetId, first), "UPDATE1A");
-    if (!halves.second.empty())
-        SendUdpPacket(BuildPacket("UPDATE1B", packetId, second), "UPDATE1B");
-    return true;
+	g_cachedMovement.clear();
+	g_cachedUpdate1 = ParsedHalves();
+	g_haveCachedUpdate1 = false;
+	g_presence = "none";
+	g_lastScriptActivityTick = 0;
+	g_lastKeepaliveTick = 0;
+	g_menuTransitionDeadlineTick = 0;
 }
 
-static bool PollUpdate2(int localPlayerId, const std::string& packetId)
+static bool IsTruthyField(const std::string &value)
 {
-    std::string out;
-    bool ok = g_client.ExecTagged("wo_get2(" + std::to_string(localPlayerId) + ", \"" + EscapeExecQuoted(username, '"') + "\")", "wo2", out, 500);
-    if (!ok)
-        return false;
-
-    ParsedHalves halves = ParseValuesSplitHalf(out);
-    std::vector<std::string> movement;
-    if (!RemoveMovementPrefix(halves, movement))
-        return false;
-
-    int movementSequence = NextSequence(g_movementSequence);
-    int updateSequence = NextSequence(g_update2Sequence);
-    SendMovementPacket(packetId, movement, movementSequence);
-
-    std::vector<std::string> first = halves.first;
-    std::vector<std::string> second = halves.second;
-    first.insert(first.begin(), std::to_string(updateSequence));
-    second.insert(second.begin(), std::to_string(updateSequence));
-
-    if (!halves.first.empty())
-        SendUdpPacket(BuildPacket("UPDATE2A", packetId, first), "UPDATE2A");
-    if (!halves.second.empty())
-        SendUdpPacket(BuildPacket("UPDATE2B", packetId, second), "UPDATE2B");
-    return true;
+	return value == "true" || value == "1" || value == "True" || value == "TRUE";
 }
 
-static bool PollUpdate3(int localPlayerId, const std::string& packetId)
+static bool ScriptTransportStalled(ULONGLONG now)
 {
-    std::string out;
-    bool ok = g_client.ExecTagged("wo_get3(" + std::to_string(localPlayerId) + ", \"" + EscapeExecQuoted(username, '"') + "\")", "wo3", out, 500);
-    if (!ok)
-        return false;
-
-    ParsedHalves halves = ParseValuesSplitHalf(out);
-    std::vector<std::string> movement;
-    if (!RemoveMovementPrefix(halves, movement))
-        return false;
-
-    int movementSequence = NextSequence(g_movementSequence);
-    int updateSequence = NextSequence(g_update3Sequence);
-    SendMovementPacket(packetId, movement, movementSequence);
-
-    std::vector<std::string> fields;
-    fields.reserve(halves.first.size() + halves.second.size() + 1);
-    fields.push_back(std::to_string(updateSequence));
-    fields.insert(fields.end(), halves.first.begin(), halves.first.end());
-    fields.insert(fields.end(), halves.second.begin(), halves.second.end());
-
-    if (fields.size() > 1)
-        SendUdpPacket(BuildPacket("UPDATE3", packetId, fields), "UPDATE3");
-    return true;
+	return g_lastScriptActivityTick != 0 && now >= g_lastScriptActivityTick && (now - g_lastScriptActivityTick) >= kScriptStallThresholdMs;
 }
 
-static bool PollUpdate4(int localPlayerId, const std::string& packetId)
+static bool CachedClientIsInGame()
 {
-    std::string out;
-    bool ok = g_client.ExecTagged("wo_get4(" + std::to_string(localPlayerId) + ", \"" + EscapeExecQuoted(username, '"') + "\")", "wo4", out, 500);
-    if (!ok)
-        return false;
-
-    ParsedHalves halves = ParseValuesSplitHalf(out);
-    std::vector<std::string> movement;
-    if (!RemoveMovementPrefix(halves, movement))
-        return false;
-
-    int movementSequence = NextSequence(g_movementSequence);
-    int updateSequence = NextSequence(g_update4Sequence);
-    SendMovementPacket(packetId, movement, movementSequence);
-
-    std::vector<std::string> fields;
-    fields.reserve(halves.first.size() + halves.second.size() + 1);
-    fields.push_back(std::to_string(updateSequence));
-    fields.insert(fields.end(), halves.first.begin(), halves.first.end());
-    fields.insert(fields.end(), halves.second.begin(), halves.second.end());
-
-    if (fields.size() > 1)
-        SendUdpPacket(BuildPacket("UPDATE4", packetId, fields), "UPDATE4");
-    return true;
+	return g_haveCachedUpdate1 && g_cachedUpdate1.first.size() > kClientInGameField && IsTruthyField(g_cachedUpdate1.first[kClientInGameField]);
 }
 
-static void PollPoseThread()
+static std::string EffectivePresence(ULONGLONG now)
 {
-    Sleep(500);
-    static const int schedule[] = { 1, 4, 1, 3, 1, 4, 1, 2, 1, 3, 1, 4 };
-    size_t scheduleIndex = 0;
+	if (!g_presence.empty() && g_presence != "none")
+		return g_presence;
 
-    while (g_run.load())
-    {
-        try
-        {
-            std::vector<ExecJob> jobs;
-            {
-                std::lock_guard<std::mutex> lk(g_qMu);
-                jobs.swap(g_jobs);
-            }
+	if (ScriptTransportStalled(now) && CachedClientIsInGame())
+		return "IngameMenu";
 
-            for (auto& job : jobs)
-            {
-                if (!g_client.IsConnected())
-                    break;
-                std::string out;
-                g_client.ExecTagged(job.code, job.tag, out, job.timeoutMs);
-            }
-
-            if (g_client.IsConnected() && g_usernameTaken.load())
-            {
-                PostExec("usernameTaken(\"" + username + "\")", "", 150);
-                Sleep(250);
-                continue;
-            }
-            if (g_client.IsConnected() && g_kicked.load())
-            {
-                PostExec("kickedMsg()", "", 150);
-                Sleep(250);
-                continue;
-            }
-            if (g_client.IsConnected() && g_banned.load())
-            {
-                PostExec("bannedMsg()", "", 150);
-                Sleep(250);
-                continue;
-            }
-            if (g_client.IsConnected() && g_notWhitelisted.load())
-            {
-                PostExec("notWhitelistedMsg()", "", 150);
-                Sleep(250);
-                continue;
-            }
-
-            if (!g_client.IsConnected())
-            {
-                Sleep(100);
-                continue;
-            }
-
-            int localPlayerId = g_localPlayerId.load();
-            std::string packetId = BuildLocalPacketId(localPlayerId);
-            int pollType = schedule[scheduleIndex % (sizeof(schedule) / sizeof(schedule[0]))];
-            scheduleIndex++;
-
-            bool ok = false;
-            if (pollType == 1)
-                ok = PollUpdate1(localPlayerId, packetId);
-            else if (pollType == 2)
-                ok = PollUpdate2(localPlayerId, packetId);
-            else if (pollType == 3)
-                ok = PollUpdate3(localPlayerId, packetId);
-            else
-                ok = PollUpdate4(localPlayerId, packetId);
-
-            if (!ok)
-                Sleep(10);
-        }
-        catch (const std::exception& e)
-        {
-            std::cout << "caught exception in poll loop: " << e.what() << std::endl;
-            Sleep(10);
-        }
-        catch (...)
-        {
-            std::cout << "caught exception in poll loop" << std::endl;
-            Sleep(10);
-        }
-    }
+	return "none";
 }
 
-static void SendToGameThread()
+static void ApplyPresenceToUpdate1(ParsedHalves &halves, ULONGLONG now)
 {
-	Sleep(1000);
+	if (halves.first.size() <= kMenuNameField)
+		return;
+
+	const std::string presence = EffectivePresence(now);
+	if (presence != "none" || ScriptTransportStalled(now))
+		halves.first[kMenuNameField] = presence;
+}
+
+static int NextSequence(int &sequence)
+{
+	if (sequence <= 0 || sequence >= kSequenceSpan)
+		sequence = 1;
+	else
+		++sequence;
+
+	return sequence;
+}
+
+static int NextMovementSequence()
+{
+	return NextSequence(g_movementSequence);
+}
+
+static void SendMovementPacket(const std::string &packetId, const std::vector<std::string> &movement)
+{
+	if (movement.size() < 7)
+		return;
+
+	const int sequence = NextMovementSequence();
+
+	std::vector<std::string> fields;
+	fields.reserve(8);
+
+	fields.push_back(std::to_string(sequence));
+	fields.insert(fields.end(), movement.begin(), movement.begin() + 7);
+
+	SendUdpPacket(BuildPacket("MOVE", packetId, fields), "MOVE");
+}
+
+static void SendMovementPayload(const std::string &payload)
+{
+	ParsedHalves halves = ParseValuesSplitHalf(payload);
+	std::vector<std::string> movement;
+	if (!ExtractMovementPrefix(halves, movement))
+		return;
+
+	g_cachedMovement = movement;
+	SendMovementPacket(BuildLocalPacketId(), movement);
+}
+
+static void SendUpdate1Halves(ParsedHalves halves, ULONGLONG now)
+{
+	if (halves.first.size() < 7)
+		return;
+
+	ApplyPresenceToUpdate1(halves, now);
+
+	const std::string packetId = BuildLocalPacketId();
+	const int movementSequence = NextMovementSequence();
+	const int updateSequence = NextSequence(g_update1Sequence);
+
+	if (!halves.first.empty())
+	{
+		halves.first.insert(halves.first.begin(), std::to_string(movementSequence));
+
+		halves.first.insert(halves.first.begin(), std::to_string(updateSequence));
+
+		SendUdpPacket(BuildPacket("UPDATE1A", packetId, halves.first), "UPDATE1A");
+	}
+
+	if (!halves.second.empty())
+	{
+		halves.second.insert(halves.second.begin(), std::to_string(movementSequence));
+
+		halves.second.insert(halves.second.begin(), std::to_string(updateSequence));
+
+		SendUdpPacket(BuildPacket("UPDATE1B", packetId, halves.second), "UPDATE1B");
+	}
+}
+
+static void SendUpdate1(const std::string &payload)
+{
+	ParsedHalves halves = ParseValuesSplitHalf(payload);
+
+	if (halves.first.size() < 7)
+		return;
+
+	g_cachedMovement.assign(halves.first.begin(), halves.first.begin() + 7);
+
+	const ULONGLONG now = GetTickCount64();
+
+	if (halves.first.size() > kMenuNameField && !halves.first[kMenuNameField].empty())
+	{
+		const std::string incomingPresence = halves.first[kMenuNameField];
+		const bool transitionPending = g_menuTransitionDeadlineTick != 0 && now < g_menuTransitionDeadlineTick;
+
+		if (transitionPending && incomingPresence == "IngameMenu" && !g_presence.empty() && g_presence != "none" && g_presence != "IngameMenu")
+		{
+			halves.first[kMenuNameField] = g_presence;
+		}
+		else
+		{
+			g_presence = incomingPresence;
+			g_menuTransitionDeadlineTick = 0;
+		}
+	}
+
+	g_cachedUpdate1 = halves;
+	g_haveCachedUpdate1 = true;
+
+	SendUpdate1Halves(std::move(halves), now);
+}
+
+static void SendUpdate2(const std::string &payload)
+{
+	ParsedHalves halves = ParseValuesSplitHalf(payload);
+
+	std::vector<std::string> movement;
+
+	if (!RemoveMovementPrefix(halves, movement))
+		return;
+
+	g_cachedMovement = movement;
+
+	const std::string packetId = BuildLocalPacketId();
+
+	const int updateSequence = NextSequence(g_update2Sequence);
+
+	if (!halves.first.empty())
+	{
+		halves.first.insert(halves.first.begin(), std::to_string(updateSequence));
+
+		SendUdpPacket(BuildPacket("UPDATE2A", packetId, halves.first), "UPDATE2A");
+	}
+
+	if (!halves.second.empty())
+	{
+		halves.second.insert(halves.second.begin(), std::to_string(updateSequence));
+
+		SendUdpPacket(BuildPacket("UPDATE2B", packetId, halves.second), "UPDATE2B");
+	}
+}
+
+static void SendCombined(const std::string &payload, const char *opcode)
+{
+	ParsedHalves halves = ParseValuesSplitHalf(payload);
+	std::vector<std::string> movement;
+	if (!RemoveMovementPrefix(halves, movement))
+		return;
+
+	g_cachedMovement = movement;
+
+	std::vector<std::string> fields;
+	fields.reserve(halves.first.size() + halves.second.size());
+	fields.insert(fields.end(), halves.first.begin(), halves.first.end());
+	fields.insert(fields.end(), halves.second.begin(), halves.second.end());
+
+	if (!fields.empty())
+		SendUdpPacket(BuildPacket(opcode, BuildLocalPacketId(), fields), opcode);
+}
+
+static std::string PayloadTag(const std::string &payload)
+{
+	const size_t space = payload.find(' ');
+	return space == std::string::npos ? payload : payload.substr(0, space);
+}
+
+static void ProcessPresence(const std::string &payload, ULONGLONG now)
+{
+	const size_t space = payload.find(' ');
+	std::string presence = (space == std::string::npos) ? "none" : payload.substr(space + 1);
+
+	if (presence.empty() || presence.size() > 64)
+		presence = "none";
+
+	g_menuTransitionDeadlineTick = 0;
+	g_presence = presence;
+
+	if (g_haveCachedUpdate1 && g_cachedUpdate1.first.size() > kMenuNameField)
+		g_cachedUpdate1.first[kMenuNameField] = presence;
+
+	if (g_haveCachedUpdate1)
+		SendUpdate1Halves(g_cachedUpdate1, now);
+}
+
+static void ProcessMenuTransition(const std::string &payload, ULONGLONG now)
+{
+	const size_t space = payload.find(' ');
+	const std::string closingMenu = (space == std::string::npos) ? std::string() : payload.substr(space + 1);
+
+	if (!closingMenu.empty() && closingMenu != g_presence)
+		return;
+
+	g_menuTransitionDeadlineTick = now + kMenuTransitionGraceMs;
+}
+
+static bool CommitDeferredMenuPresenceIfDue()
+{
+	if (g_menuTransitionDeadlineTick == 0)
+		return false;
+
+	const ULONGLONG now = GetTickCount64();
+	if (now < g_menuTransitionDeadlineTick)
+		return false;
+
+	g_menuTransitionDeadlineTick = 0;
+
+	if (g_presence == "IngameMenu")
+		return false;
+
+	g_presence = "IngameMenu";
+
+	if (g_haveCachedUpdate1 && g_cachedUpdate1.first.size() > kMenuNameField)
+	{
+		g_cachedUpdate1.first[kMenuNameField] = g_presence;
+		SendUpdate1Halves(g_cachedUpdate1, now);
+		return true;
+	}
+
+	return false;
+}
+
+static bool SendTransportKeepaliveIfDue()
+{
+	if (!wo_native::IsConnected() || g_lastScriptActivityTick == 0)
+		return false;
+
+	const ULONGLONG now = GetTickCount64();
+	if (!ScriptTransportStalled(now))
+		return false;
+
+	if (g_lastKeepaliveTick != 0 && now >= g_lastKeepaliveTick && (now - g_lastKeepaliveTick) < kKeepaliveIntervalMs)
+	{
+		return false;
+	}
+
+	bool sent = false;
+	const std::string packetId = BuildLocalPacketId();
+
+	if (g_cachedMovement.size() >= 7)
+	{
+		SendMovementPacket(packetId, g_cachedMovement);
+		sent = true;
+	}
+
+	if (g_haveCachedUpdate1)
+	{
+		SendUpdate1Halves(g_cachedUpdate1, now);
+		sent = true;
+	}
+
+	if (sent)
+		g_lastKeepaliveTick = now;
+
+	return sent;
+}
+
+static void ProcessOutbound(const std::string &payload)
+{
+	const std::string tag = PayloadTag(payload);
+
+	if (tag == "offline")
+	{
+		ResetTransportWatchdog();
+		return;
+	}
+
+	const bool scriptTransportPayload = tag == "move" || tag == "wo" || tag == "wo2" || tag == "wo3" || tag == "wo4" || tag == "presence" || tag == "presence_transition";
+
+	if (!scriptTransportPayload)
+		return;
+
+	const ULONGLONG now = GetTickCount64();
+	g_lastScriptActivityTick = now;
+	g_lastKeepaliveTick = 0;
+
+	if (tag == "move")
+		SendMovementPayload(payload);
+	else if (tag == "wo")
+		SendUpdate1(payload);
+	else if (tag == "wo2")
+		SendUpdate2(payload);
+	else if (tag == "wo3")
+		SendCombined(payload, "UPDATE3");
+	else if (tag == "wo4")
+		SendCombined(payload, "UPDATE4");
+	else if (tag == "presence")
+		ProcessPresence(payload, now);
+	else if (tag == "presence_transition")
+		ProcessMenuTransition(payload, now);
+}
+
+static void QueueMovement(int playerId, const std::string &playerUsername, const std::vector<std::string> &movement)
+{
+	if (playerId <= 0 || playerUsername.empty() || movement.size() < 8)
+		return;
+
+	wo_native::InboundMessage message;
+	message.opcode = wo_native::InboundOpcode::Move;
+	message.playerId = playerId;
+	message.sender = playerUsername;
+
+	// sequence + x y z w heading speed area
+	message.fields.assign(movement.begin(), movement.begin() + 8);
+
+	wo_native::PushInbound(std::move(message));
+}
+
+static void QueueUpdate1(int playerId, const std::string &playerUsername, const std::vector<std::string> &update1A, const std::vector<std::string> &update1B)
+{
+	if (playerId <= 0 || playerUsername.empty())
+		return;
+
+	wo_native::InboundMessage message;
+	message.opcode = wo_native::InboundOpcode::Update1;
+	message.playerId = playerId;
+	message.sender = playerUsername;
+	message.fields.reserve(update1A.size() + update1B.size());
+	message.fields.insert(message.fields.end(), update1A.begin(), update1A.end());
+	message.fields.insert(message.fields.end(), update1B.begin(), update1B.end());
+
+	if (!message.fields.empty())
+		wo_native::PushInbound(std::move(message));
+}
+
+static void QueueUpdate2(int playerId, const std::string &playerUsername, const std::vector<std::string> &update2A, const std::vector<std::string> &update2B)
+{
+	if (playerId <= 0 || playerUsername.empty())
+		return;
+
+	wo_native::InboundMessage message;
+	message.opcode = wo_native::InboundOpcode::Update2;
+	message.playerId = playerId;
+	message.sender = playerUsername;
+	message.fields.reserve(update2A.size() + update2B.size());
+	message.fields.insert(message.fields.end(), update2A.begin(), update2A.end());
+	message.fields.insert(message.fields.end(), update2B.begin(), update2B.end());
+
+	if (!message.fields.empty())
+		wo_native::PushInbound(std::move(message));
+}
+
+static void QueueUpdate3(int playerId, const std::string &playerUsername, std::vector<std::string> &&fields)
+{
+	if (playerId <= 0 || playerUsername.empty() || fields.size() < 6)
+		return;
+
+	wo_native::InboundMessage message;
+	message.opcode = wo_native::InboundOpcode::Update3;
+	message.playerId = playerId;
+	message.sender = playerUsername;
+	message.fields = std::move(fields);
+	wo_native::PushInbound(std::move(message));
+}
+
+static void QueueUpdate4(int playerId, const std::string &playerUsername, std::vector<std::string> &&fields)
+{
+	if (playerId <= 0 || playerUsername.empty() || fields.size() < 16)
+		return;
+
+	wo_native::InboundMessage message;
+	message.opcode = wo_native::InboundOpcode::Update4;
+	message.playerId = playerId;
+	message.sender = playerUsername;
+	message.fields = std::move(fields);
+	wo_native::PushInbound(std::move(message));
+}
+
+static void HandleServerPacket(const std::string &msg)
+{
+	auto parts = SplitTabs(msg);
+	if (parts.empty())
+		return;
+
+	if (parts[0] == "ERROR")
+	{
+		if (parts.size() >= 2 && parts[1] == "USERNAME_TAKEN")
+			wo_native::PushControl(wo_native::InboundOpcode::UsernameTaken);
+		else if (parts.size() >= 2 && parts[1] == "BANNED")
+			wo_native::PushControl(wo_native::InboundOpcode::Banned);
+		else if (parts.size() >= 2 && parts[1] == "NOT_WHITELISTED")
+			wo_native::PushControl(wo_native::InboundOpcode::NotWhitelisted);
+		CloseOnlineSession();
+		return;
+	}
+
+	if (parts[0] == "KICK")
+	{
+		wo_native::PushControl(wo_native::InboundOpcode::Kicked);
+		CloseOnlineSession();
+		return;
+	}
+
+	const std::string &opcode = parts[0];
+	if (opcode != "MOVE" && opcode != "UPDATE1A" && opcode != "UPDATE1B" && opcode != "UPDATE2A" && opcode != "UPDATE2B" && opcode != "UPDATE3" && opcode != "UPDATE4")
+	{
+		return;
+	}
+
+	if (parts.size() < 3)
+		return;
+
+	int playerId = 0;
+	if (!ParsePositiveInt(parts[1], playerId))
+		return;
+
+	std::string playerUsername = parts[2];
+	if (playerUsername.empty())
+		return;
+
+	if (playerUsername == username)
+	{
+		g_localPlayerId.store(playerId);
+		wo_native::SetLocalId(playerId);
+	}
+
+	std::vector<std::string> fields(parts.begin() + 3, parts.end());
+
+	if (opcode == "MOVE")
+	{
+		QueueMovement(playerId, playerUsername, fields);
+		return;
+	}
+
+	if (fields.empty())
+		return;
+
+	int packetSequence = 0;
+	int movementSequence = 0;
+
+	if (opcode == "UPDATE1A" || opcode == "UPDATE1B" || opcode == "UPDATE2A" || opcode == "UPDATE2B")
+	{
+		if (fields.empty() || !ParsePositiveInt(fields[0], packetSequence))
+		{
+			return;
+		}
+
+		fields.erase(fields.begin());
+	}
+
+	if (opcode == "UPDATE1A" || opcode == "UPDATE1B")
+	{
+		if (fields.empty() || !ParsePositiveInt(fields[0], movementSequence))
+		{
+			return;
+		}
+
+		fields.erase(fields.begin());
+	}
+
+	if (opcode == "UPDATE3" || opcode == "UPDATE4")
+	{
+		bool changed = false;
+		{
+			std::lock_guard<std::mutex> lock(remoteMu);
+			auto &rp = remotePlayers[playerId];
+			rp.username = playerUsername;
+			std::vector<std::string> &last = (opcode == "UPDATE3") ? rp.lastUpdate3 : rp.lastUpdate4;
+			if (fields != last)
+			{
+				last = fields;
+				changed = true;
+			}
+		}
+
+		if (!changed)
+			return;
+
+		if (opcode == "UPDATE3")
+			QueueUpdate3(playerId, playerUsername, std::move(fields));
+		else
+			QueueUpdate4(playerId, playerUsername, std::move(fields));
+		return;
+	}
+
+	bool push1 = false;
+	bool push2 = false;
+	std::vector<std::string> u1a;
+	std::vector<std::string> u1b;
+	std::vector<std::string> u2a;
+	std::vector<std::string> u2b;
+	std::string pushUsername;
+
+	{
+		std::lock_guard<std::mutex> lock(remoteMu);
+		auto &rp = remotePlayers[playerId];
+		rp.username = playerUsername;
+
+		if (opcode == "UPDATE1A" && packetSequence > rp.lastPushed1Sequence)
+		{
+			rp.update1A = std::move(fields);
+			rp.update1ASequence = packetSequence;
+			rp.update1AMovementSequence = movementSequence;
+		}
+		else if (opcode == "UPDATE1B" && packetSequence > rp.lastPushed1Sequence)
+		{
+			rp.update1B = std::move(fields);
+			rp.update1BSequence = packetSequence;
+			rp.update1BMovementSequence = movementSequence;
+		}
+		else if (opcode == "UPDATE2A" && packetSequence > rp.lastPushed2Sequence)
+		{
+			rp.update2A = std::move(fields);
+			rp.update2ASequence = packetSequence;
+		}
+		else if (opcode == "UPDATE2B" && packetSequence > rp.lastPushed2Sequence)
+		{
+			rp.update2B = std::move(fields);
+			rp.update2BSequence = packetSequence;
+		}
+
+		if (rp.update1ASequence > rp.lastPushed1Sequence && rp.update1ASequence == rp.update1BSequence && rp.update1AMovementSequence == rp.update1BMovementSequence)
+		{
+			rp.lastPushed1Sequence = rp.update1ASequence;
+
+			u1a = rp.update1A;
+			u1b = rp.update1B;
+
+			pushUsername = rp.username;
+			push1 = true;
+		}
+
+		if (rp.update2ASequence > rp.lastPushed2Sequence && rp.update2ASequence == rp.update2BSequence)
+		{
+			rp.lastPushed2Sequence = rp.update2ASequence;
+
+			u2a = rp.update2A;
+			u2b = rp.update2B;
+
+			pushUsername = rp.username;
+			push2 = true;
+		}
+	}
+
+	if (push1)
+		QueueUpdate1(playerId, pushUsername, u1a, u1b);
+	if (push2)
+		QueueUpdate2(playerId, pushUsername, u2a, u2b);
+}
+
+static void SenderThread()
+{
+	std::string payload;
+	bool wasConnected = false;
+
+	while (g_run.load())
+	{
+		bool worked = false;
+		const bool connected = wo_native::IsConnected();
+
+		if (connected && !wasConnected)
+			ResetTransportWatchdog();
+		else if (!connected && wasConnected)
+			ResetTransportWatchdog();
+
+		wasConnected = connected;
+
+		while (g_run.load() && wo_native::PopOutbound(payload))
+		{
+			if (wo_native::IsConnected())
+				ProcessOutbound(payload);
+			worked = true;
+		}
+
+		if (wo_native::IsConnected() && CommitDeferredMenuPresenceIfDue())
+			worked = true;
+
+		if (wo_native::IsConnected() && SendTransportKeepaliveIfDue())
+			worked = true;
+
+		if (!worked)
+			Sleep(1);
+	}
+}
+
+static void ReceiverThread()
+{
 	std::vector<char> data(8192);
 
 	while (g_run.load())
@@ -951,45 +931,57 @@ static void SendToGameThread()
 		try
 		{
 			asio::ip::udp::endpoint senderEndpoint;
-
-			std::size_t len = theSocket.receive_from(
-				asio::buffer(data),
-				senderEndpoint
-			);
-
+			std::size_t len = theSocket.receive_from(asio::buffer(data), senderEndpoint);
 			std::string msg(data.data(), len);
 			HandleServerPacket(msg);
-			//std::cout << "Receive packet: " << msg << "\n";
 		}
-		catch (const std::exception& e) {
-			std::cout << "Receive error: " << e.what() << "\n";
-			Sleep(500);
+		catch (const std::exception &e)
+		{
+			if (g_run.load() && wo_native::IsConnected())
+				std::cout << "Receive error: " << e.what() << "\n";
+
+			if (g_run.load())
+				Sleep(500);
 		}
 	}
 }
 
-void connectServer()
+static void connectServer()
 {
 	if (g_shutdown.load())
 		return;
 
-	g_client.Start();
+	try
+	{
+		g_run.store(true);
+		theSocket.open(asio::ip::udp::v4());
+		theSocket.bind(asio::ip::udp::endpoint(asio::ip::udp::v4(), 0));
+		serverEndpoint = *resolver.resolve(asio::ip::udp::v4(), ip, port).begin();
+		theSocket.connect(serverEndpoint);
+		wo_native::SetConnected(true);
 
-	g_run.store(true);
-
-	theSocket.open(asio::ip::udp::v4());
-	theSocket.bind(asio::ip::udp::endpoint(asio::ip::udp::v4(), 0));
-	serverEndpoint = *resolver.resolve(asio::ip::udp::v4(), ip, port).begin();
-	theSocket.connect(serverEndpoint);
-
-	g_poll = std::thread(PollPoseThread);
-	g_game = std::thread(SendToGameThread);
+		g_sender = std::thread(SenderThread);
+		g_receiver = std::thread(ReceiverThread);
+	}
+	catch (const std::exception &e)
+	{
+		wo_native::SetConnected(false);
+		std::cout << "Connection error: " << e.what() << "\n";
+	}
 }
 
-void initScript()
+static void initScript()
 {
 	fs::path baseDir = getExecutablePath();
-	fs::path fullPath = baseDir / "WitcherOnline" / "config.xml";
+	fs::path woDir = baseDir / "WitcherOnline";
+
+	fs::create_directories(woDir);
+
+	wo_native::InitLog((woDir / "WitcherOnline.log").string());
+
+	wo_native::DebugLog("startup");
+
+	fs::path fullPath = woDir / "config.xml";
 
 	pugi::xml_document doc;
 	pugi::xml_parse_result result = doc.load_file(fullPath.c_str());
@@ -997,27 +989,47 @@ void initScript()
 	if (result)
 	{
 		pugi::xml_node xml = doc.child("Config");
-
 		if (xml)
 		{
 			std::string user = xml.child("Username").text().as_string();
-
 			username = std::regex_replace(user, std::regex("[^A-Za-z0-9_]"), "");
 
 			if (username.length() > 16)
-			{
 				username.resize(16);
-			}
 
 			ip = xml.child("ServerIP").text().as_string();
 			port = xml.child("Port").text().as_string();
 
 			if (username.length() < 2 || username == "none")
-			{
 				username = "Player";
-			}
 		}
 	}
+
+	wo_native::SetUsername(username);
+
+	if (!wo_native::ResolveScriptApi())
+	{
+		wo_native::DebugLog("script API signature resolution failed");
+		return;
+	}
+
+	wo_native::DebugLog("script API signature resolution OK");
+
+	if (!wo_native::CanMarshalStrings())
+	{
+		wo_native::DebugLog("script string marshalling resolution failed");
+		return;
+	}
+
+	wo_native::DebugLog("script string marshalling resolution OK");
+
+	if (!wo_native::InstallRegistrationHook())
+	{
+		wo_native::DebugLog("registration hook failed: " + wo_native::RegistrationError());
+		return;
+	}
+
+	wo_native::DebugLog("registration hook installed OK");
 
 	connectServer();
 }
@@ -1027,46 +1039,46 @@ static DWORD WINAPI InitThreadProc(LPVOID)
 	if (g_shutdown.load())
 		return 0;
 
-	//activateConsole();
-
-	if (g_shutdown.load())
-		return 0;
-
 	initScript();
 	return 0;
 }
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
-	switch (reason) {
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
+{
+	switch (reason)
+	{
 	case DLL_PROCESS_ATTACH:
 		DisableThreadLibraryCalls(hModule);
 		g_initThread = CreateThread(nullptr, 0, InitThreadProc, nullptr, 0, nullptr);
-		if (g_initThread) {
+		if (g_initThread)
+		{
 			CloseHandle(g_initThread);
 			g_initThread = NULL;
 		}
 		break;
+
 	case DLL_PROCESS_DETACH:
-	{
 		g_shutdown.store(true);
 		g_run.store(false);
-		theSocket.close();
-		g_client.Stop();
+		wo_native::SetConnected(false);
 
+		try
 		{
-			std::lock_guard<std::mutex> lk(g_qMu);
-			g_jobs.clear();
+			if (theSocket.is_open())
+				theSocket.close();
+		}
+		catch (...)
+		{
 		}
 
-		if (g_poll.joinable())
-			g_poll.join();
+		if (g_sender.joinable())
+			g_sender.join();
+		if (g_receiver.joinable())
+			g_receiver.join();
 
-		if (g_game.joinable())
-			g_game.join();
-
-		//FreeConsole();
+		wo_native::RemoveRegistrationHook();
 		break;
 	}
-	}
+
 	return TRUE;
 }

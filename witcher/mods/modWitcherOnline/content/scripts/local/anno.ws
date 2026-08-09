@@ -17,27 +17,12 @@ public function r_getMultiplayerClient(): r_MultiplayerClient
 @wrapMethod(CR4Player)
 function OnSpawned(spawnData: SEntitySpawnData) 
 {    
-    theGame.r_getMultiplayerClient().setInGame(true);
     theGame.r_getMultiplayerClient().setSpawnTime(theGame.GetEngineTimeAsSeconds());
     theGame.r_getMultiplayerClient().startTick();
 
     wrappedMethod(spawnData);
-}
 
-@addMethod(CR4Player) 
-timer function r_showConnectionAlert(dt : float, id : int)
-{
-    var wo_messagetitle : string;
-    var wo_messagebody  : string;
-
-    wo_messagetitle = GetLocStringById(2111114266);
-
-    wo_messagebody = GetLocStringById(2111114267) + "<br/><br/>"
-        + GetLocStringById(2111114268) + "<br/><br/>"
-        + GetLocStringById(2111114269) + "<br/>"
-        + "https://rejuvenate.gitbook.io/witcheronline/guides/troubleshooting<br/>";
-    
-    theGame.r_getMultiplayerClient().tutorialPopup(wo_messagetitle, wo_messagebody);
+    theGame.r_getMultiplayerClient().WO_PublishPresence(theGame.r_getMultiplayerClient().WO_GetPresence(), true);
 }
 
 @addMethod(CR4Player) 
@@ -205,6 +190,9 @@ function OnEnteredMainMenu()
 {
     wrappedMethod();
     theGame.r_getMultiplayerClient().setInGame(false);
+    theGame.r_getMultiplayerClient().setServerReceived(false);
+    theGame.r_getMultiplayerClient().WO_SetTeleporting(false);
+    WO_Send("offline");
 }
 
 @wrapMethod(CR4Game)
@@ -217,11 +205,9 @@ function OnAfterLoadingScreenGameStart()
 
     theInput.MP_newSharedutilsOnelinersManager();
 
-    if(!theGame.r_getMultiplayerClient().getReceived())
-    {
-        thePlayer.AddTimer('r_showConnectionAlert', 1, false);
-    }
-    else if(theGame.r_getMultiplayerClient().getUsernameTaken() && !theGame.r_getMultiplayerClient().getJoinMessage())
+    MP_SU_updateMinimapPins();
+
+    if(theGame.r_getMultiplayerClient().getUsernameTaken() && !theGame.r_getMultiplayerClient().getJoinMessage())
     {
         thePlayer.AddTimer('r_showUsernameAlert', 1, false);
         theGame.r_getMultiplayerClient().setAlertedDisconnect();
@@ -239,17 +225,26 @@ function OnAfterLoadingScreenGameStart()
         theGame.r_getMultiplayerClient().setAlertedDisconnect();
         theGame.r_getMultiplayerClient().setJoinMessage();
     }
-    else if(theGame.r_getMultiplayerClient().getReceived() && !theGame.r_getMultiplayerClient().getJoinMessage() && !theGame.r_getMultiplayerClient().getUsernameTaken() && !theGame.r_getMultiplayerClient().getBanned() && !theGame.r_getMultiplayerClient().getNotWhitelisted())
+    else if(!theGame.r_getMultiplayerClient().getJoinMessage() && !theGame.r_getMultiplayerClient().getUsernameTaken() && !theGame.r_getMultiplayerClient().getBanned() && !theGame.r_getMultiplayerClient().getNotWhitelisted())
     {
         thePlayer.AddTimer('r_showWelcome', 1, false);
         thePlayer.AddTimer('r_showJoinMessage', 1.5, false);
         theGame.r_getMultiplayerClient().setJoinMessage();
     }
+
+    if(thePlayer)
+    {
+        thePlayer.RemoveTimer('WO_CheckTeleportFinished');
+    }
+    
+    theGame.r_getMultiplayerClient().WO_SetTeleporting(false);
 }
 
 @wrapMethod(CR4Game)
 function OnGameLoadInitFinishedSuccess()
 {
+    theGame.r_getMultiplayerClient().WO_SetTeleporting(true);
+    theGame.r_getMultiplayerClient().WO_PublishPresence("Teleporting", true);
     wrappedMethod();
     theGame.r_getMultiplayerClient().destroyAll();
     theGame.r_getMultiplayerClient().setInGame(false);
@@ -958,19 +953,6 @@ var wo_crownsAmount : int;
 @addField(W3ItemSelectionPopupData)
 var wo_betAmount : int;
 
-@wrapMethod(CExplorationStateManager) 
-function UpdateCameraIfNeeded( out moveData : SCameraMovementData, dt : float ) : bool
-{
-	if ( (theGame.r_getMultiplayerClient().isRiding()))
-	{
-		return theGame.r_getMultiplayerClient().updateCamera(moveData,dt);
-	}
-	else
-	{
-		return wrappedMethod(moveData, dt);
-	}
-}
-
 @addMethod(CInputManager)
 function IgnoreGameInput( actionName : name, ignore : bool );
 
@@ -1399,4 +1381,86 @@ function OnActivate() : EBTNodeStatus
     {
         return wrappedMethod();
     }
+}
+
+@wrapMethod(CR4MenuBase)
+function OnMenuShown()
+{
+    wrappedMethod();
+
+    if(thePlayer)
+    {
+        theGame.r_getMultiplayerClient().WO_PublishPresence(
+            NameToString(this.GetMenuName()),
+            true
+        );
+    }
+}
+
+@wrapMethod(CR4IngameMenu)
+function OnRequestSubMenu(menuName : name, optional initData : IScriptable)
+{
+    if(thePlayer)
+    {
+        theGame.r_getMultiplayerClient().WO_PublishPresence(
+            NameToString(menuName),
+            true
+        );
+    }
+
+    wrappedMethod(menuName, initData);
+}
+
+@wrapMethod(CR4MenuBase)
+function OnClosingMenu()
+{
+    var closingMenu : string;
+
+    closingMenu = NameToString(this.GetMenuName());
+
+    wrappedMethod();
+
+    if(thePlayer)
+    {
+        theGame.r_getMultiplayerClient().WO_PublishPresenceTransition(
+            closingMenu
+        );
+    }
+}
+
+@wrapMethod(CR4MapMenu)
+function OnStaticMapPinUsed(pinTag : name, areaId : int)
+{
+    var didTravel : bool;
+
+    didTravel = wrappedMethod(pinTag, areaId);
+
+    if(didTravel && thePlayer)
+    {
+        theGame.r_getMultiplayerClient().WO_SetTeleporting(true);
+        theGame.r_getMultiplayerClient().WO_PublishPresence("Teleporting", true);
+
+        thePlayer.RemoveTimer('WO_CheckTeleportFinished');
+        thePlayer.AddTimer('WO_CheckTeleportFinished', 0.25, false);
+    }
+
+    return didTravel;
+}
+
+@addMethod(CR4Player)
+timer function WO_CheckTeleportFinished(dt : float, id : int)
+{
+    if(!theGame.r_getMultiplayerClient().WO_GetTeleporting())
+    {
+        return;
+    }
+
+    if(theGame.IsBlackscreen() || theGame.IsLoadingScreenVideoPlaying())
+    {
+        this.AddTimer('WO_CheckTeleportFinished', 0.25, false);
+        return;
+    }
+
+    theGame.r_getMultiplayerClient().WO_SetTeleporting(false);
+    theGame.r_getMultiplayerClient().WO_UpdatePresence();
 }

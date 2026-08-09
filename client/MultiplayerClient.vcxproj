@@ -156,16 +156,19 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="DebugExecClient.h" />
     <ClInclude Include="framework.h" />
-    <ClInclude Include="NetProto.h" />
+    <ClInclude Include="GameModule.h" />
+    <ClInclude Include="InlineHook.h" />
+    <ClInclude Include="NativeBridge.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="script.h" />
+    <ClInclude Include="SignatureScanner.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="DebugExecClient.cpp" />
     <ClCompile Include="dllmain.cpp" />
-    <ClCompile Include="NetProto.cpp" />
+    <ClCompile Include="GameModule.cpp" />
+    <ClCompile Include="InlineHook.cpp" />
+    <ClCompile Include="NativeBridge.cpp" />
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
@@ -174,6 +177,7 @@
     </ClCompile>
     <ClCompile Include="pugixml\pugixml.cpp" />
     <ClCompile Include="script.cpp" />
+    <ClCompile Include="SignatureScanner.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

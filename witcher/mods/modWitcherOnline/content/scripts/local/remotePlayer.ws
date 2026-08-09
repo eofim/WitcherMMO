@@ -338,6 +338,18 @@ statemachine class r_RemotePlayer
     default chillOutNPCCleanupAt = -999;
     default chillOutNPCCleanupInterval = 1.0;
 
+    protected var npcAdjustorDelay : float;
+    default npcAdjustorDelay = 0.4;
+
+    protected var horseAdjustorDelay : float;
+    default horseAdjustorDelay = 0.4;
+
+    protected var boatAdjustorDelay : float;
+    default boatAdjustorDelay = 0.4;
+
+    protected var morphAdjustorDelay : float;
+    default morphAdjustorDelay = 0.4;
+
     public function setDeck(val : SDeckDefinition)
     {
         gwentGame.deck = val;
@@ -1710,6 +1722,8 @@ statemachine class r_RemotePlayer
 
         if(menuName == "InCutscene")
             status = GetLocStringById(2111114105);
+        else if(menuName == "Teleporting")
+            status = "Teleporting...";
         else if (menuName == "IngameMenu")
             status = GetLocStringById(2111114106);
         else if (menuName == "GlossaryBestiaryMenu")
@@ -2393,17 +2407,19 @@ statemachine class r_RemotePlayer
     {
         var ids : array<SItemUniqueId>;
         var ent : CEntity;
+        var equipped : bool;
 
         lastItem = normalizeNGPItem(lastItem);
         newItem = normalizeNGPItem(newItem);
-        
-        if (lastItem != '' && lastItem != newItem)
+
+        if(lastItem != '' && lastItem != newItem)
         {
             ids = inv.GetItemsByName(lastItem);
-            if (ids.Size() > 0)
+
+            if(ids.Size() > 0)
             {
                 if(mount)
-                {   
+                {
                     inv.UnmountItem(ids[0], true);
                 }
                 else
@@ -2415,10 +2431,28 @@ statemachine class r_RemotePlayer
             }
         }
 
+        if(newItem == '')
+        {
+            lastItem = newItem;
+            return;
+        }
+
         ids = inv.GetItemsByName(newItem);
-        if (ids.Size() == 0)
+
+        if(ids.Size() == 0)
         {
             ids = inv.AddAnItem(newItem, 1);
+        }
+
+        if(ids.Size() == 0)
+        {
+            return;
+        }
+
+        ent = inv.GetItemEntityUnsafe(ids[0]);
+
+        if(!ent)
+        {
             if(mount)
             {
                 inv.MountItem(ids[0]);
@@ -2427,15 +2461,20 @@ statemachine class r_RemotePlayer
             {
                 ghost.EquipItem(ids[0]);
             }
+
+            ent = inv.GetItemEntityUnsafe(ids[0]);
         }
 
-        ent = inv.GetItemEntityUnsafe(ids[0]);
-        if (ent)
+        if(ent)
         {
             ent.SetHideInGame(hide);
+            equipped = true;
         }
 
-        lastItem = newItem;
+        if(equipped)
+        {
+            lastItem = newItem;
+        }
     }
 
     private function updateDye(inv : CInventoryComponent, val : name, dye : string)
@@ -5899,7 +5938,7 @@ statemachine class r_RemotePlayer
         adjustor.Cancel(adjustor.GetRequest('w3mp_ghost'));
         ticket = adjustor.CreateNewRequest('w3mp_ghost');
 
-        adjustor.AdjustmentDuration(ticket, 0.5);
+        adjustor.AdjustmentDuration(ticket, npcAdjustorDelay);
         adjustor.AdjustLocationVertically(ticket, true);
         adjustor.ScaleAnimationLocationVertically(ticket, true);
         adjustor.RotateTo(ticket, heading); 
@@ -6240,7 +6279,7 @@ state WO_UpdateCPC in r_RemotePlayer
         adjustor.Cancel(adjustor.GetRequest('w3mp_horsesync'));
         ticket = adjustor.CreateNewRequest('w3mp_horsesync');
 
-        adjustor.AdjustmentDuration(ticket, 0.5);
+        adjustor.AdjustmentDuration(ticket, parent.horseAdjustorDelay);
         adjustor.AdjustLocationVertically(ticket, true);
         adjustor.ScaleAnimationLocationVertically(ticket, true);
         adjustor.RotateTo(ticket, parent.heading); 
@@ -6319,7 +6358,7 @@ state WO_UpdateCPC in r_RemotePlayer
         adjustor.Cancel(adjustor.GetRequest('w3mp_boatsync'));
         ticket = adjustor.CreateNewRequest('w3mp_boatsync');
 
-        adjustor.AdjustmentDuration(ticket, 0.5);
+        adjustor.AdjustmentDuration(ticket, parent.boatAdjustorDelay);
         adjustor.AdjustLocationVertically(ticket, true);
         adjustor.ScaleAnimationLocationVertically(ticket, true);
         adjustor.RotateTo(ticket, parent.heading); 
@@ -6461,7 +6500,7 @@ state WO_UpdateCPC in r_RemotePlayer
             adjustor.Cancel(adjustor.GetRequest('w3mp_morphsync'));
             ticket = adjustor.CreateNewRequest('w3mp_morphsync');
 
-            adjustor.AdjustmentDuration(ticket, 0.5);
+            adjustor.AdjustmentDuration(ticket, parent.morphAdjustorDelay);
             adjustor.AdjustLocationVertically(ticket, true);
             adjustor.ScaleAnimationLocationVertically(ticket, true);
             adjustor.RotateTo(ticket, parent.heading); 

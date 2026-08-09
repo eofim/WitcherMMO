@@ -1,5 +1,11 @@
 // Witcher Online by rejuvenate
 // https://www.nexusmods.com/profile/rejuvenate7
+import function WO_Send(payload : string) : bool;
+import function WO_Poll() : int;
+import function WO_Str(index : int) : string;
+import function WO_NameAt(index : int) : name;
+import function WO_Tick() : int;
+
 struct r_ChillDef 
 { 
     var anim : name; 
@@ -64,7 +70,6 @@ statemachine class r_MultiplayerClient
     private var globalPlayersByServerId : MP_SU_HashMap;
     private var inGame : bool;
     private var spawnTime : float;
-    private var execReceived : bool;
     private var serverReceived : bool;
 
     private var lightAttackAnims : array<r_Anim>;
@@ -231,6 +236,19 @@ statemachine class r_MultiplayerClient
     private var seenPartyPlayers : array<string>;
     private var lastHideCompanion : bool;
     default lastHideCompanion = true;
+
+    private var wo_nativePresence : string;
+    private var wo_isTeleporting : bool;
+
+    public function WO_SetTeleporting(val : bool)
+    {
+        wo_isTeleporting = val;
+    }
+
+    public function WO_GetTeleporting() : bool
+    {
+        return wo_isTeleporting;
+    }
 
     public function getPartyMembers() : array<r_RemotePlayer>
     {
@@ -2316,7 +2334,10 @@ statemachine class r_MultiplayerClient
         ridingEnabled = true;
 
         thePlayer.EnableCollisions(false);
-        thePlayer.SetExplCamera(false);
+        if(thePlayer.GetExplCamera())
+        {
+            thePlayer.SetExplCamera(false);
+        }
 
         theInput.IgnoreGameInput( 'GI_AxisLeftX', true );
         theInput.IgnoreGameInput( 'GI_AxisLeftY', true );
@@ -2623,30 +2644,12 @@ statemachine class r_MultiplayerClient
         mpghosts_playSound('gui_global_highlight');
     }
 
-    function updateCamera( out moveData : SCameraMovementData, dt : float ) : bool
-    {
-        var camera								: CCustomCamera;
-        var cameraPreset						: SCustomCameraPreset;
-        
-        camera = (CCustomCamera)theCamera.GetTopmostCameraObject();
-        cameraPreset = camera.GetActivePreset();
-
-        camera.ChangePivotDistanceController( 'Default' );
-        camera.ChangePivotPositionController( 'Default' );
-        
-        moveData.pivotDistanceController = camera.GetActivePivotDistanceController();
-        moveData.pivotPositionController = camera.GetActivePivotPositionController();
-
-        moveData.pivotDistanceController.SetDesiredDistance(cameraPreset.distance + 1.0f);
-        moveData.pivotPositionController.SetDesiredPosition(thePlayer.GetWorldPosition());
-        return true;
-    }
-
     public function stopRiding()
     {
         if(!ridingEnabled)
             return;
 
+        thePlayer.SetPlayerCameraPreset();
         ridingEnabled = false;
         thePlayer.EnableCollisions(true);
         detachRiderSafe(thePlayer, true);
@@ -2713,6 +2716,9 @@ statemachine class r_MultiplayerClient
 
     public function Init()
     {
+        wo_nativePresence = "";
+        serverReceived = false;
+
         inParty = false;
         joinedParty = "";
         joinedPartyAt = -999;
@@ -2922,6 +2928,140 @@ statemachine class r_MultiplayerClient
         }
 
         return false;
+    }
+
+    public function WO_GetPresence() : string
+    {
+        var rootMenu : CR4Menu;
+        var subMenu : CR4Menu;
+
+        if(wo_isTeleporting)
+        {
+            return "Teleporting";
+        }
+
+        rootMenu = (CR4Menu)theGame.GetGuiManager().GetRootMenu();
+
+        if(rootMenu)
+        {
+            subMenu = (CR4Menu)rootMenu.GetSubMenu();
+
+            if(subMenu)
+            {
+                return NameToString(subMenu.GetMenuName());
+            }
+
+            return NameToString(rootMenu.GetMenuName());
+        }
+
+        if(theGame.IsDialogOrCutscenePlaying() || theGame.IsCurrentlyPlayingNonGameplayScene())
+        {
+            return "InCutscene";
+        }
+
+        if(theGame.IsPaused())
+        {
+            return "IngameMenu";
+        }
+
+        return "none";
+    }
+
+    public function WO_PublishPresence(presence : string, force : bool)
+    {
+        if(wo_isTeleporting)
+        {
+            presence = "Teleporting";
+        }
+
+        if(force || wo_nativePresence != presence)
+        {
+            wo_nativePresence = presence;
+            WO_Send("presence "+presence);
+        }
+    }
+
+    public function WO_UpdatePresence()
+    {
+        WO_PublishPresence(WO_GetPresence(), false);
+    }
+
+    public function WO_PublishPresenceTransition(closingMenu : string)
+    {
+        WO_Send("presence_transition "+closingMenu);
+    }
+
+    public function WO_PumpTransport()
+    {
+        var tickMask : int;
+        var doMove : bool;
+        var doGather1 : bool;
+        var doGather2 : bool;
+        var doGather3 : bool;
+        var doGather4 : bool;
+
+        if(!getInGame() || !thePlayer)
+        {
+            return;
+        }
+
+        WO_UpdatePresence();
+
+        WO_PumpInbound(128);
+        setUserId(WO_LocalId(), WO_Username());
+
+        tickMask = WO_Tick();
+        if(tickMask <= 0)
+        {
+            return;
+        }
+
+        if(tickMask >= 16)
+        {
+            doGather4 = true;
+            tickMask -= 16;
+        }
+        if(tickMask >= 8)
+        {
+            doGather3 = true;
+            tickMask -= 8;
+        }
+        if(tickMask >= 4)
+        {
+            doGather2 = true;
+            tickMask -= 4;
+        }
+        if(tickMask >= 2)
+        {
+            doGather1 = true;
+            tickMask -= 2;
+        }
+        if(tickMask >= 1)
+        {
+            doMove = true;
+        }
+
+        if(doMove && !WO_Send("move "+wo_getMovementData()))
+        {
+            return;
+        }
+
+        if(doGather1)
+        {
+            wo_get1(WO_LocalId(), WO_Username());
+        }
+        if(doGather2)
+        {
+            wo_get2(WO_LocalId(), WO_Username());
+        }
+        if(doGather3)
+        {
+            wo_get3(WO_LocalId(), WO_Username());
+        }
+        if(doGather4)
+        {
+            wo_get4(WO_LocalId(), WO_Username());
+        }
     }
 
     public function startTick()
@@ -3374,19 +3514,9 @@ statemachine class r_MultiplayerClient
         return inParty;
     }
 
-    public function setReceived()
+    public function setServerReceived(val : bool)
     {
-        execReceived = true;
-    }
-
-    public function getReceived() : bool
-    {
-        return execReceived;
-    }
-
-    public function setServerReceived()
-    {
-        serverReceived = true;
+        serverReceived = val;
     }
 
     public function getServerReceived() : bool
@@ -3969,7 +4099,7 @@ statemachine class r_MultiplayerClient
         var createdLocal : bool;
         var currentArea : int;
 
-        setServerReceived();
+        setServerReceived(true);
         ensurePlayerHashMaps();
 
         if(serverPlayerId <= 0)
@@ -4250,7 +4380,7 @@ statemachine class r_MultiplayerClient
         var gp : r_RemotePlayer;
         var now : float;
 
-        setServerReceived();
+        setServerReceived(true);
         ensurePlayerHashMaps();
 
         if(serverPlayerId <= 0)
@@ -4320,7 +4450,7 @@ statemachine class r_MultiplayerClient
         var gwentCards : array<int>;
         var deck : SDeckDefinition;
 
-        setServerReceived();
+        setServerReceived(true);
         ensurePlayerHashMaps();
 
         if(serverPlayerId <= 0)
@@ -4402,7 +4532,7 @@ statemachine class r_MultiplayerClient
         var now : float;
         var parsedDialogChoices : array<wo_SSceneChoice>;
 
-        setServerReceived();
+        setServerReceived(true);
         ensurePlayerHashMaps();
 
         if(serverPlayerId <= 0)
@@ -5176,237 +5306,507 @@ statemachine class r_MultiplayerClient
             riderHorseAnchors.Erase(i);
         }
     }
-}
 
-function wo_getMovementData() : string
-{
-    var pos : Vector;
-    var list : string;
-    var transformedNPC : CActor;
-    var morphMap : NR_Map;
-    var morphActive : int;
-
-    pos = thePlayer.GetWorldPosition();
-    transformedNPC = theGame.GetActorByTag('NR_TRANSFORM_NPC');
-    morphMap = NR_GetMagicManager().GetMap('none');
-    morphActive = morphMap.getI("nr_polymorphysm_active");
-
-    list += pos.X;
-    list += " ";
-    list += pos.Y;
-    list += " ";
-    list += pos.Z;
-    list += " ";
-    list += pos.W;
-    list += " ";
-    list += thePlayer.GetHeading();
-    list += " ";
-
-    if(transformedNPC && morphActive)
-        list += transformedNPC.GetBehaviorVariable('Editor_MovementSpeed');
-    else
-        list += thePlayer.GetMovingAgentComponent().GetRelativeMoveSpeed();
-
-    list += " ";
-    list += theGame.GetCommonMapManager().GetCurrentArea();
-    list += " ";
-    return list;
-}
-
-exec function wo_get(playerId : int, username : string)
-{
-    var list : string;
-    var inv : CInventoryComponent;
-    var steel, silver : SItemUniqueId;
-    var ids : array<SItemUniqueId>;
-    var offhandItem : bool;
-    var theHorse : CActor;
-    var type 		: EExplorationType;
-    var selectedItemId : SItemUniqueId;
-    var playerRotation      : EulerAngles;
-    var rootMenu : CR4Menu;
-
-    var id : SItemUniqueId;
-    var steelName : name;
-    var silverName : name;
-    var armor : name;
-    var gloves : name;
-    var pants : name;
-    var boots : name;
-    var i : int;
-    var acs : array< CComponent >;
-	var head : name;
-	var hair : name;
-	var steelScab : name;
-	var silverScab : name;
-	var crossbow : name;
-	var mask : name;
-
-    var fallDist : float;
-
-    var ridingPlayer : r_RemotePlayer;
-    var outgoingPlayer : string;
-    var outgoingTradeItem : name;
-
-    var horseAppearance : string;
-
-    var morphMap : NR_Map;
-    var morphActive : int;
-    var morphType : name;
-    var morphAppearance : name;
-
-    var transformedNPC : CActor;
-
-    theGame.r_getMultiplayerClient().setUserId(playerId, username);
-    theGame.r_getMultiplayerClient().setReceived();
-
-    inv = thePlayer.GetInventory();
-
-    transformedNPC = theGame.GetActorByTag('NR_TRANSFORM_NPC');
-    morphMap = NR_GetMagicManager().GetMap('none');
-
-    morphActive = morphMap.getI("nr_polymorphysm_active");
-    morphType = morphMap.getN("nr_polymorphysm_type");
-    morphAppearance = morphMap.getN("nr_polymorphysm_appearance");
-
-    list += theGame.r_getMultiplayerClient().getInGame();
-    list += " ";
-
-    if(!thePlayer.IsCiri())
+    function WO_Int(index : int) : int
     {
-        if( inv.GetItemEquippedOnSlot(EES_SilverSword, silver) && inv.IsItemHeld(silver))
+        return StringToInt(WO_Str(index), 0);
+    }
+
+    function WO_Float(index : int) : float
+    {
+        return StringToFloat(WO_Str(index));
+    }
+
+    function WO_Bool(index : int) : bool
+    {
+        var value : string;
+
+        value = WO_Str(index);
+        return value == "true" || value == "1";
+    }
+
+    function WO_PlayerId() : int
+    {
+        return StringToInt(WO_Str(-2), 0);
+    }
+
+    function WO_SenderName() : name
+    {
+        return WO_NameAt(-1);
+    }
+
+    function WO_FieldCount() : int
+    {
+        return StringToInt(WO_Str(-3), 0);
+    }
+
+    function WO_LocalId() : int
+    {
+        return StringToInt(WO_Str(-5), 0);
+    }
+
+    function WO_Username() : string
+    {
+        return WO_Str(-4);
+    }
+
+    function WO_GlobalPlayerByServerId(serverPlayerId : int) : r_RemotePlayer
+    {
+        var globals : array<r_RemotePlayer>;
+        var i : int;
+
+        globals = theGame.r_getMultiplayerClient().getGlobalPlayers();
+
+        for(i = 0; i < globals.Size(); i += 1)
         {
-            list += "silver";
+            if(globals[i] && globals[i].serverPlayerId == serverPlayerId)
+            {
+                return globals[i];
+            }
         }
-        else if( inv.GetItemEquippedOnSlot(EES_SteelSword, steel) && inv.IsItemHeld(steel))
+
+        return NULL;
+    }
+
+    function WO_ApplyMovement()
+    {
+        var client : r_MultiplayerClient;
+        var serverPlayerId : int;
+        var movementSequence : int;
+
+        client = theGame.r_getMultiplayerClient();
+        serverPlayerId = WO_PlayerId();
+        movementSequence = WO_Int(0);
+
+        if(!client || serverPlayerId <= 0 || movementSequence <= 0)
         {
-            list += "steel";
+            return;
+        }
+
+        client.updatePlayerMovement(
+            serverPlayerId,
+            WO_SenderName(),
+            movementSequence,
+
+            WO_Float(1), // X
+            WO_Float(2), // Y
+            WO_Float(3), // Z
+            WO_Float(4), // W
+
+            WO_Float(5), // heading
+            WO_Float(6), // speed
+            WO_Int(7)    // area
+        );
+    }
+
+    function WO_ApplyUpdate1()
+    {
+        var client : r_MultiplayerClient;
+        var p : r_RemotePlayer;
+        var gp : r_RemotePlayer;
+        var serverPlayerId : int;
+
+        var moveX, moveY, moveZ, moveW : float;
+        var moveHeading, moveSpeed : float;
+        var moveArea : int;
+
+        var stateMovementSequence : int;
+
+        client = theGame.r_getMultiplayerClient();
+        serverPlayerId = WO_PlayerId();
+
+        if(!client || serverPlayerId <= 0)
+        {
+            return;
+        }
+
+        moveX = WO_Float(0);
+        moveY = WO_Float(1);
+        moveZ = WO_Float(2);
+        moveW = WO_Float(3);
+        moveHeading = WO_Float(4);
+        moveSpeed = WO_Float(5);
+        moveArea = WO_Int(6);
+
+        p = client.getPlayerByServerId(serverPlayerId);
+        gp = WO_GlobalPlayerByServerId(serverPlayerId);
+
+        stateMovementSequence = 0;
+
+        if(!p)
+        {
+            stateMovementSequence = 1;
+
+            if(gp)
+            {
+                moveX = gp.pos.X;
+                moveY = gp.pos.Y;
+                moveZ = gp.pos.Z;
+                moveW = gp.pos.W;
+
+                moveHeading = gp.heading;
+                moveSpeed = gp.speed;
+                moveArea = (int)gp.area;
+
+                if(gp.lastMovementSequence > 0)
+                {
+                    stateMovementSequence = gp.lastMovementSequence;
+                }
+            }
+        }
+
+        client.updatePlayerData(
+            serverPlayerId,
+            WO_SenderName(),
+            stateMovementSequence,
+            moveX, moveY, moveZ, moveW,
+            moveHeading, moveSpeed, moveArea,
+            WO_Bool(7), WO_Str(8), WO_Str(9), WO_Bool(10), WO_Bool(11),
+            WO_NameAt(12), WO_Float(13),
+            (EJumpType)WO_Int(14), (EClimbHeightType)WO_Int(15),
+            WO_Bool(16), WO_Bool(17),
+            WO_Float(18), WO_Float(19), WO_Float(20), WO_Float(21), WO_Bool(22),
+            WO_Float(23), WO_Float(24), WO_Float(25), WO_Bool(26),
+            (ESignType)WO_Int(27), WO_Float(28), WO_Bool(29), WO_Bool(30),
+            WO_Float(31), WO_Bool(32), WO_Bool(33), WO_NameAt(34), WO_Bool(35), WO_Bool(36),
+            WO_Int(37), WO_Float(38), WO_Float(39), WO_Str(40), WO_NameAt(41),
+            WO_Float(42), WO_Float(43), WO_Bool(44), WO_Bool(45),
+            WO_Bool(46), WO_Str(47), WO_Float(48),
+            (EPlayerExplorationAction)WO_Int(49),
+            WO_NameAt(50), WO_NameAt(51), WO_NameAt(52), WO_NameAt(53),
+            WO_NameAt(54), WO_NameAt(55), WO_NameAt(56), WO_NameAt(57),
+            WO_NameAt(58), WO_NameAt(59), WO_NameAt(60), WO_NameAt(61),
+            WO_Bool(62), WO_Int(63), WO_Str(64), WO_NameAt(65),
+            WO_Int(66), WO_Int(67), WO_Str(68),
+            WO_Bool(69), WO_NameAt(70), WO_NameAt(71), WO_Float(72)
+        );
+    }
+    function WO_ApplyUpdate2()
+    {
+        theGame.r_getMultiplayerClient().updatePlayerData2(
+            WO_PlayerId(),
+            WO_SenderName(),
+            (ENR_PlayerType)WO_Int(0),
+            WO_NameAt(1), WO_Str(2), WO_Str(3), WO_Str(4), WO_Str(5), WO_Str(6),
+            WO_Str(7), WO_Str(8), WO_Str(9), WO_Str(10),
+            WO_Str(11), WO_Str(12), WO_Str(13), WO_Str(14), WO_Str(15),
+            WO_Str(16), WO_Str(17), WO_Str(18), WO_Str(19), WO_Str(20));
+    }
+
+    function WO_ApplyUpdate3()
+    {
+        var gwentData : string;
+        var count : int;
+        var i : int;
+
+        count = WO_FieldCount();
+        gwentData = "";
+
+        for(i = 6; i < count; i += 1)
+        {
+            if(i > 6)
+            {
+                gwentData += " ";
+            }
+
+            gwentData += WO_Str(i);
+        }
+
+        theGame.r_getMultiplayerClient().updatePlayerData3(
+            WO_PlayerId(),
+            WO_SenderName(),
+            WO_Str(0),
+            (E_GwentRequest)WO_Int(1),
+            WO_Int(2), WO_Int(3),
+            WO_Str(4), WO_Float(5),
+            gwentData);
+    }
+
+    function WO_ApplyUpdate4()
+    {
+        theGame.r_getMultiplayerClient().updatePlayerData4(
+            WO_PlayerId(),
+            WO_SenderName(),
+            WO_Bool(0), WO_Str(1), WO_NameAt(2),
+            WO_Int(3), WO_Int(4), WO_Int(5), WO_Int(6),
+            WO_Int(7), WO_Int(8), WO_Str(9), WO_Bool(10),
+            WO_Int(11), WO_Int(12), WO_Int(13), WO_Int(14),
+            WO_Float(15));
+    }
+
+    function WO_PumpInbound(maxMessages : int)
+    {
+        var processed : int;
+        var opcode : int;
+        var client : r_MultiplayerClient;
+
+        client = theGame.r_getMultiplayerClient();
+
+        for(processed = 0; processed < maxMessages; processed += 1)
+        {
+            opcode = WO_Poll();
+
+            if(opcode < 0)
+            {
+                return;
+            }
+
+            switch(opcode)
+            {
+                case 1:
+                    WO_ApplyMovement();
+                    break;
+
+                case 2:
+                    WO_ApplyUpdate1();
+                    break;
+
+                case 3:
+                    WO_ApplyUpdate2();
+                    break;
+
+                case 4:
+                    WO_ApplyUpdate3();
+                    break;
+
+                case 5:
+                    WO_ApplyUpdate4();
+                    break;
+
+                case 6:
+                    client.setUsernameTaken(WO_Username());
+                    break;
+
+                case 7:
+                    client.setKicked();
+                    break;
+
+                case 8:
+                    client.setBanned();
+                    break;
+
+                case 9:
+                    client.setNotWhitelisted();
+                    break;
+
+                default:
+                    break;
+            }
+        }
+    }
+
+    function wo_get1(playerId : int, username : string)
+    {
+        var list : string;
+        var inv : CInventoryComponent;
+        var steel, silver : SItemUniqueId;
+        var ids : array<SItemUniqueId>;
+        var offhandItem : bool;
+        var theHorse : CActor;
+        var type 		: EExplorationType;
+        var selectedItemId : SItemUniqueId;
+        var playerRotation      : EulerAngles;
+
+        var id : SItemUniqueId;
+        var steelName : name;
+        var silverName : name;
+        var armor : name;
+        var gloves : name;
+        var pants : name;
+        var boots : name;
+        var i : int;
+        var acs : array< CComponent >;
+        var head : name;
+        var hair : name;
+        var steelScab : name;
+        var silverScab : name;
+        var crossbow : name;
+        var mask : name;
+
+        var fallDist : float;
+
+        var ridingPlayer : r_RemotePlayer;
+        var outgoingPlayer : string;
+        var outgoingTradeItem : name;
+
+        var horseAppearance : string;
+
+        var morphMap : NR_Map;
+        var morphActive : int;
+        var morphType : name;
+        var morphAppearance : name;
+
+        var transformedNPC : CActor;
+
+        theGame.r_getMultiplayerClient().setUserId(playerId, username);
+
+        inv = thePlayer.GetInventory();
+
+        transformedNPC = theGame.GetActorByTag('NR_TRANSFORM_NPC');
+        morphMap = NR_GetMagicManager().GetMap('none');
+
+        morphActive = morphMap.getI("nr_polymorphysm_active");
+        morphType = morphMap.getN("nr_polymorphysm_type");
+        morphAppearance = morphMap.getN("nr_polymorphysm_appearance");
+
+        list += theGame.r_getMultiplayerClient().getInGame();
+        list += " ";
+
+        if(!thePlayer.IsCiri())
+        {
+            if( inv.GetItemEquippedOnSlot(EES_SilverSword, silver) && inv.IsItemHeld(silver))
+            {
+                list += "silver";
+            }
+            else if( inv.GetItemEquippedOnSlot(EES_SteelSword, steel) && inv.IsItemHeld(steel))
+            {
+                list += "steel";
+            }
+            else
+            {
+                list += "none";
+            }
         }
         else
         {
+            if(GetCiriPlayer().inv.IsItemHeld(GetCiriPlayer().GetEquippedSword(true)))
+            {
+                list += "steel";
+            }
+            else
+            {
+                list += "none";
+            }
+        }
+
+        list += " ";
+
+        offhandItem = false;
+
+        ids = inv.GetItemsByName('Torch');
+        if(inv.IsItemHeld(ids[0]))
+        {
+            list += "torch";
+            offhandItem = true;
+        }
+
+        if(!offhandItem)
+        {
             list += "none";
         }
-    }
-    else
-    {
-        if(GetCiriPlayer().inv.IsItemHeld(GetCiriPlayer().GetEquippedSword(true)))
+        
+        list += " ";
+
+        list += thePlayer.IsInCombat();
+        list += " ";
+
+        list += thePlayer.IsSwimming();
+        list += " ";
+
+        list += thePlayer.substateManager.GetStateCur();
+        list += " ";
+
+        list += theGame.r_getMultiplayerClient().getLastJumpTime();
+        list += " ";
+
+        list += (int)thePlayer.substateManager.m_SharedDataO.m_JumpTypeE;
+        list += " ";
+
+        list += ((int)thePlayer.GetBehaviorVariable('ClimbHeightType'));
+        list += " ";
+
+        list += thePlayer.IsDiving();
+        list += " ";
+
+        thePlayer.GetFallDist(fallDist);
+
+        list += (fallDist > 0.05 && thePlayer.IsFalling());
+        list += " ";
+
+        list += theGame.r_getMultiplayerClient().getLastLightTime();
+        list += " ";
+
+        list += theGame.r_getMultiplayerClient().getLastHeavyTime();
+        list += " ";
+
+        list += theGame.r_getMultiplayerClient().getLastDodgeTime();
+        list += " ";
+        
+        list += theGame.r_getMultiplayerClient().getLastRollTime();
+        list += " ";
+
+        list += thePlayer.IsGuarded();
+        list += " ";
+
+        list += theGame.r_getMultiplayerClient().getLastHit();
+        list += " ";
+
+        list += theGame.r_getMultiplayerClient().getLastParry();
+        list += " ";
+
+        list += theGame.r_getMultiplayerClient().getLastFinisher();
+        list += " ";
+
+        list += theGame.r_getMultiplayerClient().getFinisherMonster();
+        list += " ";
+
+        list += (int)thePlayer.GetCurrentlyCastSign();
+        list += " ";
+        
+        list += theGame.r_getMultiplayerClient().getLastSignTime();
+        list += " ";
+
+        list += thePlayer.IsSailing();
+        list += " ";
+
+        list += thePlayer.IsUsingHorse(true);
+        list += " ";
+
+        if ( thePlayer.IsUsingHorse(true) )
         {
-            list += "steel";
-        }
-        else
-        {
-            list += "none";
-        }
-    }
+            theHorse = (CActor)thePlayer.GetUsedHorseComponent().GetEntity();
 
-    list += " ";
-
-    offhandItem = false;
-
-    ids = inv.GetItemsByName('Torch');
-    if(inv.IsItemHeld(ids[0]))
-    {
-        list += "torch";
-        offhandItem = true;
-    }
-
-    if(!offhandItem)
-    {
-        list += "none";
-    }
-    
-    list += " ";
-
-    list += thePlayer.IsInCombat();
-    list += " ";
-
-    list += thePlayer.IsSwimming();
-    list += " ";
-
-    list += thePlayer.substateManager.GetStateCur();
-    list += " ";
-
-    list += theGame.r_getMultiplayerClient().getLastJumpTime();
-    list += " ";
-
-    list += thePlayer.substateManager.m_SharedDataO.m_JumpTypeE;
-    list += " ";
-
-    list += ((EClimbHeightType)((int)thePlayer.GetBehaviorVariable('ClimbHeightType')));
-    list += " ";
-
-    list += thePlayer.IsDiving();
-    list += " ";
-
-    thePlayer.GetFallDist(fallDist);
-
-    list += (fallDist > 0.05 && thePlayer.IsFalling());
-    list += " ";
-
-    list += theGame.r_getMultiplayerClient().getLastLightTime();
-    list += " ";
-
-    list += theGame.r_getMultiplayerClient().getLastHeavyTime();
-    list += " ";
-
-    list += theGame.r_getMultiplayerClient().getLastDodgeTime();
-    list += " ";
-    
-    list += theGame.r_getMultiplayerClient().getLastRollTime();
-    list += " ";
-
-    list += thePlayer.IsGuarded();
-    list += " ";
-
-    list += theGame.r_getMultiplayerClient().getLastHit();
-    list += " ";
-
-    list += theGame.r_getMultiplayerClient().getLastParry();
-    list += " ";
-
-    list += theGame.r_getMultiplayerClient().getLastFinisher();
-    list += " ";
-
-    list += theGame.r_getMultiplayerClient().getFinisherMonster();
-    list += " ";
-
-    list += thePlayer.GetCurrentlyCastSign();
-    list += " ";
-    
-    list += theGame.r_getMultiplayerClient().getLastSignTime();
-    list += " ";
-
-    list += thePlayer.IsSailing();
-    list += " ";
-
-    list += thePlayer.IsUsingHorse(true);
-    list += " ";
-
-    if ( thePlayer.IsUsingHorse(true) )
-    {
-		theHorse = (CActor)thePlayer.GetUsedHorseComponent().GetEntity();
-
-        if(theHorse)
-        {
-            list += VecLength2D(((CActor)theHorse).GetMovingAgentComponent().GetVelocity());
+            if(theHorse)
+            {
+                list += VecLength2D(((CActor)theHorse).GetMovingAgentComponent().GetVelocity());
+            }
+            else
+            {
+                list += "0";
+            }
         }
         else
         {
             list += "0";
         }
-    }
-    else
-    {
-        list += "0";
-    }
-    list += " ";
+        list += " ";
 
-    list += thePlayer.GetIsAimingCrossbow();
-    list += " ";
-    
-    if(thePlayer.GetTraverser().GetExplorationType( type ))
-    {
-        if( type == ET_Ladder )
+        list += thePlayer.GetIsAimingCrossbow();
+        list += " ";
+        
+        if(thePlayer.GetTraverser().GetExplorationType( type ))
+        {
+            if( type == ET_Ladder )
+            {
+                list += "true";
+            }
+            else
+            {
+                list += "false";
+            }
+        }
+        else
+        {
+            list += "false";
+        }
+
+        list += " ";
+
+        list += thePlayer.GetCurrentStateName();
+        list += " ";
+        
+        selectedItemId = thePlayer.GetSelectedItemId();
+        if(thePlayer.inv.IsItemBomb(selectedItemId) && (thePlayer.inv.SingletonItemGetAmmo(selectedItemId) > 0) )
         {
             list += "true";
         }
@@ -5414,786 +5814,726 @@ exec function wo_get(playerId : int, username : string)
         {
             list += "false";
         }
-    }
-    else
-    {
-        list += "false";
-    }
+        list += " ";
+        
+        list += thePlayer.IsAlive();
+        list += " ";
 
-    list += " ";
+        list += theGame.r_getMultiplayerClient().getEmote();
+        list += " ";
 
-    list += thePlayer.GetCurrentStateName();
-    list += " ";
-	
-	selectedItemId = thePlayer.GetSelectedItemId();
-    if(thePlayer.inv.IsItemBomb(selectedItemId) && (thePlayer.inv.SingletonItemGetAmmo(selectedItemId) > 0) )
-    {
-        list += "true";
-    }
-    else
-    {
-        list += "false";
-    }
-	list += " ";
-    
-    list += thePlayer.IsAlive();
-    list += " ";
+        list += theGame.r_getMultiplayerClient().getLastEmoteTime();
+        list += " ";
 
-    list += theGame.r_getMultiplayerClient().getEmote();
-    list += " ";
+        list += theGame.r_getMultiplayerClient().getLastChatTime();
+        list += " ";
 
-    list += theGame.r_getMultiplayerClient().getLastEmoteTime();
-    list += " ";
-
-    list += theGame.r_getMultiplayerClient().getLastChatTime();
-    list += " ";
-
-    list += "_s ";
-    list += theGame.r_getMultiplayerClient().getChat();
-    list += " _e ";
-
-    list += ((ChillOutStateCO_Action) Chill().State()).GetAnimation();
-    list += " ";
-
-    playerRotation = thePlayer.GetWorldRotation();
-    list += playerRotation.Yaw;
-    list += " ";
-
-    list += thePlayer.abilityManager.GetStat(BCS_Stamina);
-    list += " ";
-
-    list += theGame.r_getMultiplayerClient().getSwirling();
-    list += " ";
-    
-    list += theGame.r_getMultiplayerClient().getRend();
-    list += " ";
-
-    list += GetWitcherPlayer().IsCurrentSignChanneled();
-    list += " ";
-
-	rootMenu = (CR4Menu)theGame.GetGuiManager().GetRootMenu();
-    if(rootMenu)
-    {
-        list += rootMenu.GetSubMenu().GetMenuName();
-    }
-    else
-    {
-        if(theGame.IsDialogOrCutscenePlaying() || theGame.IsCurrentlyPlayingNonGameplayScene())
-        {
-            list += "InCutscene";
-        }
-        else
-        {
-            list += "none";
-        }
-    }
-    list += " ";
-
-    list += theGame.r_getMultiplayerClient().getLastActionTime();
-    list += " ";
-
-    list += theGame.r_getMultiplayerClient().getLastAction();
-    list += " ";
-
-    // armor/items
-    inv.GetItemEquippedOnSlot(EES_SteelSword, id);
-    steelName = inv.GetItemName(id);
-
-    inv.GetItemEquippedOnSlot(EES_SilverSword, id);
-    silverName = inv.GetItemName(id);
-
-    inv.GetItemEquippedOnSlot(EES_Armor, id);
-    armor = inv.GetItemName(id);
-
-    inv.GetItemEquippedOnSlot(EES_Gloves, id);
-    gloves = inv.GetItemName(id);
-
-    inv.GetItemEquippedOnSlot(EES_Pants, id);
-    pants = inv.GetItemName(id);
-
-    inv.GetItemEquippedOnSlot(EES_Boots, id);
-    boots = inv.GetItemName(id);
-
-    inv.GetItemEquippedOnSlot(EES_Quickslot2, id);
-
-    if(inv.IsItemMask(id))
-    {
-        mask = inv.GetItemName(id);
-    }
-
-    acs = thePlayer.GetComponentsByClassName( 'CHeadManagerComponent' );
-	head = ( ( CHeadManagerComponent ) acs[0] ).GetCurHeadName();
-
-    ids = inv.GetItemsByCategory('hair');
-    for( i=0; i < ids.Size(); i +=  1 )
-    {
-        hair = inv.GetItemName( ids[i] );
-    }
-
-    ids = inv.GetItemsByCategory('steel_scabbards');
-    
-    for( i=0; i < ids.Size(); i +=  1 )
-    {
-        if(inv.IsItemHeld(ids[i]) || GetWitcherPlayer().IsItemEquipped(ids[i]) || inv.IsItemMounted(ids[i]))
-        {
-            steelScab = inv.GetItemName( ids[i] );
-            break;
-        }
-    }
-
-    ids = inv.GetItemsByCategory('silver_scabbards');
-    for( i=0; i < ids.Size(); i +=  1 )
-    {
-        if(inv.IsItemHeld(ids[i]) || GetWitcherPlayer().IsItemEquipped(ids[i]) || inv.IsItemMounted(ids[i]))
-        {
-            silverScab = inv.GetItemName( ids[i] );
-            break;
-        }
-    }
-
-    inv.GetItemEquippedOnSlot(EES_RangedWeapon, id);
-    crossbow = inv.GetItemName(id);
-
-     // separator
-    list += "half ";
-
-    list += "_s ";
-    if(thePlayer.IsCiri() && GetCiriPlayer().HasSword())
-    {
-        list += 'Zireal Sword';
-    }
-    else
-    {
-        list += steelName;
-    }
-    list += " _e ";
-
-    list += "_s ";
-    list += silverName;
-    list += " _e ";
-
-    list += "_s ";
-    list += armor;
-    list += " _e ";
-
-    list += "_s ";
-    list += gloves;
-    list += " _e ";
-
-    list += "_s ";
-    list += pants;
-    list += " _e ";
-
-    list += "_s ";
-    list += boots;
-    list += " _e ";
-
-    list += "_s ";
-    list += head;
-    list += " _e ";
-
-    list += "_s ";
-    list += hair;
-    list += " _e ";
-
-    list += "_s ";
-    list += steelScab;
-    list += " _e ";
-
-    list += "_s ";
-    list += silverScab;
-    list += " _e ";
-
-    list += "_s ";
-    list += crossbow;
-    list += " _e ";
-
-    list += "_s ";
-    list += mask;
-    list += " _e ";
-
-    list += theGame.r_getMultiplayerClient().isRiding();
-    list += " ";
-
-    ridingPlayer = theGame.r_getMultiplayerClient().getRidingPlayer();
-
-    if(ridingPlayer && ridingPlayer.serverPlayerId > 0)
-    {
-        list += ridingPlayer.serverPlayerId;
-    }
-    else
-    {
-        list += "0";
-    }
-    list += " ";
-
-    outgoingPlayer = theGame.r_getMultiplayerClient().getOutgoingTradeTo();
-
-    if(outgoingPlayer != "")
-    {
-        list += outgoingPlayer;
-    }
-    else
-    {
-        list += "none";
-    }
-    list += " ";
-
-    outgoingTradeItem = theGame.r_getMultiplayerClient().getOutgoingTradeItem();
-
-    if(outgoingTradeItem != '')
-    {
         list += "_s ";
-        list += outgoingTradeItem;
-        list += " _e";
-    }
-    else
-    {
-        list += "none";
-    }
-    list += " ";
+        list += theGame.r_getMultiplayerClient().getChat();
+        list += " _e ";
 
-    list += theGame.r_getMultiplayerClient().getOutgoingTradePrice();
-    list += " ";
-
-    list += theGame.r_getMultiplayerClient().getOutgoingTradeFlag();
-    list += " ";
-    
-    horseAppearance = theGame.GetInGameConfigWrapper().GetVarValue('MPGhosts_Main', 'MPGhosts_HorseAppearance');
-
-    if(horseAppearance == "0" || horseAppearance == "1" || horseAppearance == "2" || horseAppearance == "3" || horseAppearance == "4" || horseAppearance == "5")
-    {
-        list += horseAppearance;
-    }
-    else
-    {
-        list += "none";
-    }
-    list += " ";
-
-    if(morphActive == 1)
-    {
-        list += "true";
-    }
-    else
-    {
-        list += "false";
-    }
-    list += " ";
-
-    if(morphType != '')
-    {
-        list += morphType;
-    }
-    else
-    {
-        list += "none";
-    }
-    list += " ";
-
-    if(morphAppearance != '')
-    {
-        list += morphAppearance;
-    }
-    else
-    {
-        list += "none";
-    }
-    list += " ";
-
-    if(transformedNPC && morphActive)
-    {
-        list += transformedNPC.GetBehaviorVariable('Editor_MovementRotation');
-    }
-    else
-    {
-        list += "0";
-    }
-    list += " ";
-
-    Log("wo "+wo_getMovementData()+list);
-}
-
-exec function wo_get2(playerId : int, username : string)
-{
-    var pos : Vector;
-    var list : string;
-    var inv : CInventoryComponent;
-    var user : string;
-    var i : int;
-    
-    // cpc
-    var templates : array< array<String> >;
-    var appearanceItems : array< array<String> >;
-    var heads : array< name >;
-    var curType : ENR_PlayerType;
-
-    theGame.r_getMultiplayerClient().setUserId(playerId, username);
-    theGame.r_getMultiplayerClient().setReceived();
-
-    inv = thePlayer.GetInventory();
-    pos = thePlayer.GetWorldPosition();
-
-    user = theGame.r_getMultiplayerClient().getUsername();
-
-    // cpc
-    templates = NR_GetPlayerManager().m_appearanceTemplates;
-    appearanceItems = NR_GetPlayerManager().m_appearanceItems;
-    heads = NR_GetPlayerManager().mpghosts_GetHeads();
-
-    curType = NR_GetPlayerManager().GetCurrentPlayerType();
-
-    list += curType;
-    list += " ";
-
-    if(heads[curType] != '')
-    {
-        list += heads[curType];
-    }
-    else
-    {
-        list += "none";
-    }
-    list += " ";
-
-    if(templates[curType][ENR_RSlotHair] != "")
-    {
-        list += templates[curType][ENR_RSlotHair];
-    }
-    else
-    {
-        list += "none";
-    }
-    list += " ";
-
-    if(templates[curType][ENR_RSlotBody] != "")
-    {
-        list += templates[curType][ENR_RSlotBody];
-    }
-    else
-    {
-        list += "none";
-    }
-    list += " ";
-
-    if(templates[curType][ENR_RSlotTorso] != "")
-    {
-        list += templates[curType][ENR_RSlotTorso];
-    }
-    else
-    {
-        list += "none";
-    }
-    list += " ";
-
-    if(templates[curType][ENR_RSlotArms] != "")
-    {
-        list += templates[curType][ENR_RSlotArms];
-    }
-    else
-    {
-        list += "none";
-    }
-    list += " ";
-
-    if(templates[curType][ENR_RSlotGloves] != "")
-    {
-        list += templates[curType][ENR_RSlotGloves];
-    }
-    else
-    {
-        list += "none";
-    }
-    list += " ";
-
-    if(templates[curType][ENR_RSlotDress] != "")
-    {
-        list += templates[curType][ENR_RSlotDress];
-    }
-    else
-    {
-        list += "none";
-    }
-    list += " ";
-
-    if(templates[curType][ENR_RSlotLegs] != "")
-    {
-        list += templates[curType][ENR_RSlotLegs];
-    }
-    else
-    {
-        list += "none";
-    }
-    list += " ";
-
-    if(templates[curType][ENR_RSlotShoes] != "")
-    {
-        list += templates[curType][ENR_RSlotShoes];
-    }
-    else
-    {
-        list += "none";
-    }
-    list += " ";
-
-    if(templates[curType][ENR_RSlotMisc] != "")
-    {
-        list += templates[curType][ENR_RSlotMisc];
-    }
-    else
-    {
-        list += "none";
-    }
-    list += " ";
-
-    list += "half ";
-
-    // cpc items
-    for(i = 0; i < 9; i+=1)
-    {
-        if(appearanceItems[curType][i] != "")
-        {
-            list += appearanceItems[curType][i];
-        }
-        else
-        {
-            list += "none";
-        }
+        list += ((ChillOutStateCO_Action) Chill().State()).GetAnimation();
         list += " ";
-    }
 
-    if(NR_GetPlayerManager().IsRealEquipmentModeEnabled())
-    {
-        list += "EquipmentMode";
-    }
-    else
-    {
-        if(appearanceItems[curType][9] != "")
-        {
-            list += appearanceItems[curType][9];
-        }
-        else
-        {
-            list += "none";
-        }
-    }
-    list += " ";
-
-    Log("wo2 "+wo_getMovementData()+list);
-}
-
-exec function wo_get3(playerId : int, username : string)
-{
-    var manager : CR4GwintManager;
-    var selectedFaction : eGwintFaction;
-    var deck : SDeckDefinition;
-    var i : int;
-    var list : string;
-    var outgoingGwentTo : string;
-    var lastGwentAction : string;
-    
-    theGame.r_getMultiplayerClient().setUserId(playerId, username);
-    theGame.r_getMultiplayerClient().setReceived();
-
-    manager = theGame.GetGwintManager();
-    selectedFaction = manager.GetSelectedPlayerDeck();
-    deck = manager.GetCurrentPlayerDeck();
-    
-    outgoingGwentTo = theGame.r_getMultiplayerClient().getOutgoingGwentTo();
-
-    if(outgoingGwentTo != "")
-    {
-        list += outgoingGwentTo;
-    }
-    else
-    {
-        list += "none";
-    }
-    list += " ";
-
-    list += theGame.r_getMultiplayerClient().getOutgoingGwentRequest();
-    list += " ";
-
-    list += theGame.r_getMultiplayerClient().getOutgoingGwentBet();
-    list += " ";
-
-    list += theGame.r_getMultiplayerClient().getOutgoingGwentSeed();
-    list += " ";
-
-    //actions
-
-    lastGwentAction = theGame.r_getMultiplayerClient().getLastGwentAction();
-
-    if(lastGwentAction != "")
-    {
-        list += lastGwentAction;
-    }
-    else
-    {
-        list += "none";
-    }
-    list += " ";
-
-    list += theGame.r_getMultiplayerClient().getLastGwentActionTime();
-    list += " ";
-
-    list += selectedFaction;
-    list += " ";
-
-    list += deck.leaderIndex;
-    list += " ";
-
-    for(i = 0; i < deck.cardIndices.Size(); i+=1)
-    {
-        list += deck.cardIndices[i];
+        playerRotation = thePlayer.GetWorldRotation();
+        list += playerRotation.Yaw;
         list += " ";
-    }
 
-    Log("wo3 "+wo_getMovementData()+list);
-}
+        list += thePlayer.abilityManager.GetStat(BCS_Stamina);
+        list += " ";
 
-exec function wo_get4(playerId : int, username : string)
-{
-    var list : string;
-    var joinedParty : string;
-    var weather : name;
-    var day : int;
-    var hour : int;
-    var minute : int;
-    var second : int;
-    var dialogChoices : array<SSceneChoice>;
-    var i : int;
-    var id : SItemUniqueId;
-    var inv : CInventoryComponent;
-    var color : name;
-    var limit : int;
-    
-    theGame.r_getMultiplayerClient().setUserId(playerId, username);
-    theGame.r_getMultiplayerClient().setReceived();
+        list += theGame.r_getMultiplayerClient().getSwirling();
+        list += " ";
+        
+        list += theGame.r_getMultiplayerClient().getRend();
+        list += " ";
 
-    list += theGame.r_getMultiplayerClient().getInParty();
-    list += " ";
+        list += GetWitcherPlayer().IsCurrentSignChanneled();
+        list += " ";
 
-    joinedParty = theGame.r_getMultiplayerClient().getJoinedParty();
-    if(joinedParty != "")
-    {
-        list += joinedParty;
-    }
-    else
-    {
-        list += "none";
-    }
+        list += theGame.r_getMultiplayerClient().WO_GetPresence();
+        list += " ";
 
-    list += " ";
+        list += theGame.r_getMultiplayerClient().getLastActionTime();
+        list += " ";
 
-    weather = GetWeatherConditionName();
+        list += (int)theGame.r_getMultiplayerClient().getLastAction();
+        list += " ";
 
-    if(weather != '' && weather != ' ')
-    {
-        list += weather;
-    }
-    else
-    {
-        list += "none";
-    }
-    list += " ";
-    
-    day = GameTimeDays(theGame.GetGameTime());
-    hour = GameTimeHours(theGame.GetGameTime());
-    minute = GameTimeMinutes(theGame.GetGameTime());
-    second = GameTimeSeconds(theGame.GetGameTime());
+        // armor/items
+        inv.GetItemEquippedOnSlot(EES_SteelSword, id);
+        steelName = inv.GetItemName(id);
 
-    list += day;
-    list += " ";
+        inv.GetItemEquippedOnSlot(EES_SilverSword, id);
+        silverName = inv.GetItemName(id);
 
-    list += hour;
-    list += " ";
-    
-    list += minute;
-    list += " ";
+        inv.GetItemEquippedOnSlot(EES_Armor, id);
+        armor = inv.GetItemName(id);
 
-    list += second;
-    list += " ";
+        inv.GetItemEquippedOnSlot(EES_Gloves, id);
+        gloves = inv.GetItemName(id);
 
-    list += theGame.r_getMultiplayerClient().getLastDialogIndex();
-    list += " ";
+        inv.GetItemEquippedOnSlot(EES_Pants, id);
+        pants = inv.GetItemName(id);
 
-    list += theGame.r_getMultiplayerClient().getLastDialogCount();
-    list += " ";
+        inv.GetItemEquippedOnSlot(EES_Boots, id);
+        boots = inv.GetItemName(id);
 
-    if(theGame.r_getMultiplayerClient().getLastDialogIndex() >= 0)
-    {
-        dialogChoices = theGame.r_getMultiplayerClient().getLastSelectedDialogChoices();
-    }
-    else
-    {
-        dialogChoices = theGame.r_getMultiplayerClient().getDialogChoices();
-    }
+        inv.GetItemEquippedOnSlot(EES_Quickslot2, id);
 
-    if(dialogChoices.Size() > 0)
-    {
-        limit = dialogChoices.Size();
-
-        if(limit > 30)
+        if(inv.IsItemMask(id))
         {
-            limit = 30;
+            mask = inv.GetItemName(id);
         }
 
-        for(i = 0; i < limit; i += 1)
+        acs = thePlayer.GetComponentsByClassName( 'CHeadManagerComponent' );
+        head = ( ( CHeadManagerComponent ) acs[0] ).GetCurHeadName();
+
+        ids = inv.GetItemsByCategory('hair');
+        for( i=0; i < ids.Size(); i +=  1 )
         {
-            list += "|";
+            hair = inv.GetItemName( ids[i] );
+        }
 
-            list += theGame.r_getMultiplayerClient().boolToString(dialogChoices[i].emphasised);
-            list += "%";
-
-            list += theGame.r_getMultiplayerClient().boolToString(dialogChoices[i].previouslyChoosen);
-            list += "%";
-
-            list += theGame.r_getMultiplayerClient().boolToString(dialogChoices[i].disabled);
-            list += "%";
-
-            list += theGame.r_getMultiplayerClient().dialogActionToInt(dialogChoices[i].dialogAction);
-            list += "%";
-
-            if(dialogChoices[i].playGoChunk != '')
+        ids = inv.GetItemsByCategory('steel_scabbards');
+        
+        for( i=0; i < ids.Size(); i +=  1 )
+        {
+            if(inv.IsItemHeld(ids[i]) || GetWitcherPlayer().IsItemEquipped(ids[i]) || inv.IsItemMounted(ids[i]))
             {
-                list += dialogChoices[i].playGoChunk;
+                steelScab = inv.GetItemName( ids[i] );
+                break;
+            }
+        }
+
+        ids = inv.GetItemsByCategory('silver_scabbards');
+        for( i=0; i < ids.Size(); i +=  1 )
+        {
+            if(inv.IsItemHeld(ids[i]) || GetWitcherPlayer().IsItemEquipped(ids[i]) || inv.IsItemMounted(ids[i]))
+            {
+                silverScab = inv.GetItemName( ids[i] );
+                break;
+            }
+        }
+
+        inv.GetItemEquippedOnSlot(EES_RangedWeapon, id);
+        crossbow = inv.GetItemName(id);
+
+        // separator
+        list += "half ";
+
+        list += "_s ";
+        if(thePlayer.IsCiri() && GetCiriPlayer().HasSword())
+        {
+            list += 'Zireal Sword';
+        }
+        else
+        {
+            list += steelName;
+        }
+        list += " _e ";
+
+        list += "_s ";
+        list += silverName;
+        list += " _e ";
+
+        list += "_s ";
+        list += armor;
+        list += " _e ";
+
+        list += "_s ";
+        list += gloves;
+        list += " _e ";
+
+        list += "_s ";
+        list += pants;
+        list += " _e ";
+
+        list += "_s ";
+        list += boots;
+        list += " _e ";
+
+        list += "_s ";
+        list += head;
+        list += " _e ";
+
+        list += "_s ";
+        list += hair;
+        list += " _e ";
+
+        list += "_s ";
+        list += steelScab;
+        list += " _e ";
+
+        list += "_s ";
+        list += silverScab;
+        list += " _e ";
+
+        list += "_s ";
+        list += crossbow;
+        list += " _e ";
+
+        list += "_s ";
+        list += mask;
+        list += " _e ";
+
+        list += theGame.r_getMultiplayerClient().isRiding();
+        list += " ";
+
+        ridingPlayer = theGame.r_getMultiplayerClient().getRidingPlayer();
+
+        if(ridingPlayer && ridingPlayer.serverPlayerId > 0)
+        {
+            list += ridingPlayer.serverPlayerId;
+        }
+        else
+        {
+            list += "0";
+        }
+        list += " ";
+
+        outgoingPlayer = theGame.r_getMultiplayerClient().getOutgoingTradeTo();
+
+        if(outgoingPlayer != "")
+        {
+            list += outgoingPlayer;
+        }
+        else
+        {
+            list += "none";
+        }
+        list += " ";
+
+        outgoingTradeItem = theGame.r_getMultiplayerClient().getOutgoingTradeItem();
+
+        if(outgoingTradeItem != '')
+        {
+            list += "_s ";
+            list += outgoingTradeItem;
+            list += " _e";
+        }
+        else
+        {
+            list += "none";
+        }
+        list += " ";
+
+        list += theGame.r_getMultiplayerClient().getOutgoingTradePrice();
+        list += " ";
+
+        list += theGame.r_getMultiplayerClient().getOutgoingTradeFlag();
+        list += " ";
+        
+        horseAppearance = theGame.GetInGameConfigWrapper().GetVarValue('MPGhosts_Main', 'MPGhosts_HorseAppearance');
+
+        if(horseAppearance == "0" || horseAppearance == "1" || horseAppearance == "2" || horseAppearance == "3" || horseAppearance == "4" || horseAppearance == "5")
+        {
+            list += horseAppearance;
+        }
+        else
+        {
+            list += "none";
+        }
+        list += " ";
+
+        if(morphActive == 1)
+        {
+            list += "true";
+        }
+        else
+        {
+            list += "false";
+        }
+        list += " ";
+
+        if(morphType != '')
+        {
+            list += morphType;
+        }
+        else
+        {
+            list += "none";
+        }
+        list += " ";
+
+        if(morphAppearance != '')
+        {
+            list += morphAppearance;
+        }
+        else
+        {
+            list += "none";
+        }
+        list += " ";
+
+        if(transformedNPC && morphActive)
+        {
+            list += transformedNPC.GetBehaviorVariable('Editor_MovementRotation');
+        }
+        else
+        {
+            list += "0";
+        }
+        list += " ";
+
+        WO_Send("wo "+wo_getMovementData()+list);
+    }
+
+    function wo_get2(playerId : int, username : string)
+    {
+        var pos : Vector;
+        var list : string;
+        var inv : CInventoryComponent;
+        var user : string;
+        var i : int;
+        
+        // cpc
+        var templates : array< array<String> >;
+        var appearanceItems : array< array<String> >;
+        var heads : array< name >;
+        var curType : ENR_PlayerType;
+
+        theGame.r_getMultiplayerClient().setUserId(playerId, username);
+
+        inv = thePlayer.GetInventory();
+        pos = thePlayer.GetWorldPosition();
+
+        user = theGame.r_getMultiplayerClient().getUsername();
+
+        // cpc
+        templates = NR_GetPlayerManager().m_appearanceTemplates;
+        appearanceItems = NR_GetPlayerManager().m_appearanceItems;
+        heads = NR_GetPlayerManager().mpghosts_GetHeads();
+
+        curType = NR_GetPlayerManager().GetCurrentPlayerType();
+
+        list += (int)curType;
+        list += " ";
+
+        if(heads[curType] != '')
+        {
+            list += heads[curType];
+        }
+        else
+        {
+            list += "none";
+        }
+        list += " ";
+
+        if(templates[curType][ENR_RSlotHair] != "")
+        {
+            list += templates[curType][ENR_RSlotHair];
+        }
+        else
+        {
+            list += "none";
+        }
+        list += " ";
+
+        if(templates[curType][ENR_RSlotBody] != "")
+        {
+            list += templates[curType][ENR_RSlotBody];
+        }
+        else
+        {
+            list += "none";
+        }
+        list += " ";
+
+        if(templates[curType][ENR_RSlotTorso] != "")
+        {
+            list += templates[curType][ENR_RSlotTorso];
+        }
+        else
+        {
+            list += "none";
+        }
+        list += " ";
+
+        if(templates[curType][ENR_RSlotArms] != "")
+        {
+            list += templates[curType][ENR_RSlotArms];
+        }
+        else
+        {
+            list += "none";
+        }
+        list += " ";
+
+        if(templates[curType][ENR_RSlotGloves] != "")
+        {
+            list += templates[curType][ENR_RSlotGloves];
+        }
+        else
+        {
+            list += "none";
+        }
+        list += " ";
+
+        if(templates[curType][ENR_RSlotDress] != "")
+        {
+            list += templates[curType][ENR_RSlotDress];
+        }
+        else
+        {
+            list += "none";
+        }
+        list += " ";
+
+        if(templates[curType][ENR_RSlotLegs] != "")
+        {
+            list += templates[curType][ENR_RSlotLegs];
+        }
+        else
+        {
+            list += "none";
+        }
+        list += " ";
+
+        if(templates[curType][ENR_RSlotShoes] != "")
+        {
+            list += templates[curType][ENR_RSlotShoes];
+        }
+        else
+        {
+            list += "none";
+        }
+        list += " ";
+
+        if(templates[curType][ENR_RSlotMisc] != "")
+        {
+            list += templates[curType][ENR_RSlotMisc];
+        }
+        else
+        {
+            list += "none";
+        }
+        list += " ";
+
+        list += "half ";
+
+        // cpc items
+        for(i = 0; i < 9; i+=1)
+        {
+            if(appearanceItems[curType][i] != "")
+            {
+                list += appearanceItems[curType][i];
+            }
+            else
+            {
+                list += "none";
+            }
+            list += " ";
+        }
+
+        if(NR_GetPlayerManager().IsRealEquipmentModeEnabled())
+        {
+            list += "EquipmentMode";
+        }
+        else
+        {
+            if(appearanceItems[curType][9] != "")
+            {
+                list += appearanceItems[curType][9];
             }
             else
             {
                 list += "none";
             }
         }
+        list += " ";
+
+        WO_Send("wo2 "+wo_getMovementData()+list);
     }
-    else
+
+    function wo_get3(playerId : int, username : string)
     {
-        list += "none";
+        var manager : CR4GwintManager;
+        var selectedFaction : eGwintFaction;
+        var deck : SDeckDefinition;
+        var i : int;
+        var list : string;
+        var outgoingGwentTo : string;
+        var lastGwentAction : string;
+        
+        theGame.r_getMultiplayerClient().setUserId(playerId, username);
+
+        manager = theGame.GetGwintManager();
+        selectedFaction = manager.GetSelectedPlayerDeck();
+        deck = manager.GetCurrentPlayerDeck();
+        
+        outgoingGwentTo = theGame.r_getMultiplayerClient().getOutgoingGwentTo();
+
+        if(outgoingGwentTo != "")
+        {
+            list += outgoingGwentTo;
+        }
+        else
+        {
+            list += "none";
+        }
+        list += " ";
+
+        list += (int)theGame.r_getMultiplayerClient().getOutgoingGwentRequest();
+        list += " ";
+
+        list += theGame.r_getMultiplayerClient().getOutgoingGwentBet();
+        list += " ";
+
+        list += theGame.r_getMultiplayerClient().getOutgoingGwentSeed();
+        list += " ";
+
+        //actions
+
+        lastGwentAction = theGame.r_getMultiplayerClient().getLastGwentAction();
+
+        if(lastGwentAction != "")
+        {
+            list += lastGwentAction;
+        }
+        else
+        {
+            list += "none";
+        }
+        list += " ";
+
+        list += theGame.r_getMultiplayerClient().getLastGwentActionTime();
+        list += " ";
+
+        list += selectedFaction;
+        list += " ";
+
+        list += deck.leaderIndex;
+        list += " ";
+
+        for(i = 0; i < deck.cardIndices.Size(); i+=1)
+        {
+            list += deck.cardIndices[i];
+            list += " ";
+        }
+
+        WO_Send("wo3 "+wo_getMovementData()+list);
     }
 
-    list += " ";
-
-    list += theGame.r_getMultiplayerClient().hasActiveDialogChoices();
-    list += " ";
-
-    inv = thePlayer.GetInventory();
-    inv.GetItemEquippedOnSlot(EES_Armor, id);
-
-    if(inv.IsIdValid(id))
+    function wo_get4(playerId : int, username : string)
     {
-        color = inv.GetItemColor(id);
+        var list : string;
+        var joinedParty : string;
+        var weather : name;
+        var day : int;
+        var hour : int;
+        var minute : int;
+        var second : int;
+        var dialogChoices : array<SSceneChoice>;
+        var i : int;
+        var id : SItemUniqueId;
+        var inv : CInventoryComponent;
+        var color : name;
+        var limit : int;
+        
+        theGame.r_getMultiplayerClient().setUserId(playerId, username);
 
-        list += theGame.r_getMultiplayerClient().colorToId(color);
+        list += theGame.r_getMultiplayerClient().getInParty();
+        list += " ";
+
+        joinedParty = theGame.r_getMultiplayerClient().getJoinedParty();
+        if(joinedParty != "")
+        {
+            list += joinedParty;
+        }
+        else
+        {
+            list += "none";
+        }
+
+        list += " ";
+
+        weather = GetWeatherConditionName();
+
+        if(weather != '' && weather != ' ')
+        {
+            list += weather;
+        }
+        else
+        {
+            list += "none";
+        }
+        list += " ";
+        
+        day = GameTimeDays(theGame.GetGameTime());
+        hour = GameTimeHours(theGame.GetGameTime());
+        minute = GameTimeMinutes(theGame.GetGameTime());
+        second = GameTimeSeconds(theGame.GetGameTime());
+
+        list += day;
+        list += " ";
+
+        list += hour;
+        list += " ";
+        
+        list += minute;
+        list += " ";
+
+        list += second;
+        list += " ";
+
+        list += theGame.r_getMultiplayerClient().getLastDialogIndex();
+        list += " ";
+
+        list += theGame.r_getMultiplayerClient().getLastDialogCount();
+        list += " ";
+
+        if(theGame.r_getMultiplayerClient().getLastDialogIndex() >= 0)
+        {
+            dialogChoices = theGame.r_getMultiplayerClient().getLastSelectedDialogChoices();
+        }
+        else
+        {
+            dialogChoices = theGame.r_getMultiplayerClient().getDialogChoices();
+        }
+
+        if(dialogChoices.Size() > 0)
+        {
+            limit = dialogChoices.Size();
+
+            if(limit > 30)
+            {
+                limit = 30;
+            }
+
+            for(i = 0; i < limit; i += 1)
+            {
+                list += "|";
+
+                list += theGame.r_getMultiplayerClient().boolToString(dialogChoices[i].emphasised);
+                list += "%";
+
+                list += theGame.r_getMultiplayerClient().boolToString(dialogChoices[i].previouslyChoosen);
+                list += "%";
+
+                list += theGame.r_getMultiplayerClient().boolToString(dialogChoices[i].disabled);
+                list += "%";
+
+                list += theGame.r_getMultiplayerClient().dialogActionToInt(dialogChoices[i].dialogAction);
+                list += "%";
+
+                if(dialogChoices[i].playGoChunk != '')
+                {
+                    list += dialogChoices[i].playGoChunk;
+                }
+                else
+                {
+                    list += "none";
+                }
+            }
+        }
+        else
+        {
+            list += "none";
+        }
+
+        list += " ";
+
+        list += theGame.r_getMultiplayerClient().hasActiveDialogChoices();
+        list += " ";
+
+        inv = thePlayer.GetInventory();
+        inv.GetItemEquippedOnSlot(EES_Armor, id);
+
+        if(inv.IsIdValid(id))
+        {
+            color = inv.GetItemColor(id);
+
+            list += theGame.r_getMultiplayerClient().colorToId(color);
+        }
+        else
+        {
+            list += "0";
+        }
+        list += " ";
+
+        inv.GetItemEquippedOnSlot(EES_Gloves, id);
+
+        if(inv.IsIdValid(id))
+        {
+            color = inv.GetItemColor(id);
+
+            list += theGame.r_getMultiplayerClient().colorToId(color);
+        }
+        else
+        {
+            list += "0";
+        }
+        list += " ";
+
+        inv.GetItemEquippedOnSlot(EES_Pants, id);
+
+        if(inv.IsIdValid(id))
+        {
+            color = inv.GetItemColor(id);
+
+            list += theGame.r_getMultiplayerClient().colorToId(color);
+        }
+        else
+        {
+            list += "0";
+        }
+        list += " ";
+
+        inv.GetItemEquippedOnSlot(EES_Boots, id);
+
+        if(inv.IsIdValid(id))
+        {
+            color = inv.GetItemColor(id);
+
+            list += theGame.r_getMultiplayerClient().colorToId(color);
+        }
+        else
+        {
+            list += "0";
+        }
+        list += " ";
+
+        list += thePlayer.GetHealthPercents();
+        list += " ";
+
+        WO_Send("wo4 "+wo_getMovementData()+list);
     }
-    else
+
+    function wo_getMovementData() : string
     {
-        list += "0";
+        var pos : Vector;
+        var list : string;
+        var transformedNPC : CActor;
+        var morphMap : NR_Map;
+        var morphActive : int;
+
+        pos = thePlayer.GetWorldPosition();
+        transformedNPC = theGame.GetActorByTag('NR_TRANSFORM_NPC');
+        morphMap = NR_GetMagicManager().GetMap('none');
+        morphActive = morphMap.getI("nr_polymorphysm_active");
+
+        list += pos.X;
+        list += " ";
+        list += pos.Y;
+        list += " ";
+        list += pos.Z;
+        list += " ";
+        list += pos.W;
+        list += " ";
+        list += thePlayer.GetHeading();
+        list += " ";
+
+        if(transformedNPC && morphActive)
+            list += transformedNPC.GetBehaviorVariable('Editor_MovementSpeed');
+        else
+            list += thePlayer.GetMovingAgentComponent().GetRelativeMoveSpeed();
+
+        list += " ";
+        list += theGame.GetCommonMapManager().GetCurrentArea();
+        list += " ";
+        return list;
     }
-    list += " ";
-
-    inv.GetItemEquippedOnSlot(EES_Gloves, id);
-
-    if(inv.IsIdValid(id))
-    {
-        color = inv.GetItemColor(id);
-
-        list += theGame.r_getMultiplayerClient().colorToId(color);
-    }
-    else
-    {
-        list += "0";
-    }
-    list += " ";
-
-    inv.GetItemEquippedOnSlot(EES_Pants, id);
-
-    if(inv.IsIdValid(id))
-    {
-        color = inv.GetItemColor(id);
-
-        list += theGame.r_getMultiplayerClient().colorToId(color);
-    }
-    else
-    {
-        list += "0";
-    }
-    list += " ";
-
-    inv.GetItemEquippedOnSlot(EES_Boots, id);
-
-    if(inv.IsIdValid(id))
-    {
-        color = inv.GetItemColor(id);
-
-        list += theGame.r_getMultiplayerClient().colorToId(color);
-    }
-    else
-    {
-        list += "0";
-    }
-    list += " ";
-
-    list += thePlayer.GetHealthPercents();
-    list += " ";
-
-    Log("wo4 "+wo_getMovementData()+list);
-}
-
-exec function wo_move(serverPlayerId : int, id : name, movementSequence : int, x : float, y : float, z : float, w : float, heading : float, speed : float, area : int)
-{
-    theGame.r_getMultiplayerClient().updatePlayerMovement(serverPlayerId, id, movementSequence, x, y, z, w, heading, speed, area);
-}
-
-exec function wo_update(serverPlayerId : int, id : name, movementSequence : int, x : float, y : float, z : float, w : float, heading : float, speed : float, area : int, 
-                                        inGame : bool, heldItem : string, offhandItem : string, inCombat : bool, isSwimming : bool, curState : name, 
-                                        lastJumpTime : float, lastJumpType : EJumpType, lastClimbType : EClimbHeightType, isDiving : bool, isFalling : bool,
-                                        lastLightAttackTime : float, lastHeavyAttackTime : float, lastDodgeTime : float, lastRollTime : float, isGuarded : bool,
-                                        lastHit : float, lastParry : float, lastFinisher : float, finisherMonster : bool, signType : ESignType, lastSign : float, isSailing : bool, isMounted : bool,
-                                        horseSpeed : float, aimingCrossbow : bool, isLadder : bool, currentState : name, bombSelected : bool, isAlive : bool,
-                                        lastEmote : int, lastEmoteTime : float, lastChatTime : float, lastChat : string, chillOutAnim : name, yaw : float, stamina : float, swirling : bool, rend : bool,
-                                        channeling : bool, menuName : string, lastActionTime : float, lastAction : EPlayerExplorationAction,
-                                        steel : name, silver : name, armor : name, gloves : name, pants : name, boots : name, head : name, hair : name, steelScab : name, silverScab : name, crossbow : name, mask : name,
-                                        isRiding : bool, ridingPlayerId : int, outgoingTradeTo : string, outgoingTradeItem : name, outgoingTradePrice : int, outgoingTradeFlag : int, horseAppearance : string,
-                                        morphActive : bool, morphType : name, morphAppearance : name, morphRotation : float) 
-{
-    theGame.r_getMultiplayerClient().updatePlayerData(serverPlayerId, id, movementSequence, x, y, z, w, heading, speed, area, inGame, heldItem, offhandItem, inCombat, isSwimming, 
-                                                            curState, lastJumpTime, lastJumpType, lastClimbType, isDiving, isFalling, lastLightAttackTime,
-                                                            lastHeavyAttackTime, lastDodgeTime, lastRollTime, isGuarded, lastHit, lastParry, lastFinisher, finisherMonster,
-                                                            signType, lastSign, isSailing, isMounted, horseSpeed, aimingCrossbow, isLadder, currentState, bombSelected, isAlive,
-                                                            lastEmote, lastEmoteTime, lastChatTime, lastChat, chillOutAnim, yaw, stamina, swirling, rend,
-                                                            channeling, menuName, lastActionTime, lastAction,
-                                                            steel, silver, armor, gloves, pants, boots, head, hair, steelScab, silverScab, crossbow, mask,
-                                                            isRiding, ridingPlayerId, outgoingTradeTo, outgoingTradeItem, outgoingTradePrice, outgoingTradeFlag, horseAppearance,
-                                                            morphActive, morphType, morphAppearance, morphRotation);
-}
-
-exec function wo_update2(serverPlayerId : int, id : name, cpcPlayerType : ENR_PlayerType, cpcHead : name, cpcHair : string, cpcBody : string, cpcTorso : string, cpcArms : string, cpcGloves : string, cpcDress : string, cpcLegs : string, 
-                         cpcShoes : string, cpcMisc : string, cpcItem1 : string, cpcItem2 : string, cpcItem3 : string, cpcItem4 : string, cpcItem5 : string, cpcItem6 : string, cpcItem7 : string, cpcItem8 : string, 
-                         cpcItem9 : string, cpcItem10 : string)
-{
-    theGame.r_getMultiplayerClient().updatePlayerData2(serverPlayerId, id, cpcPlayerType, cpcHead, cpcHair, cpcBody, cpcTorso, cpcArms, cpcGloves, cpcDress, cpcLegs, cpcShoes, cpcMisc,
-                                                       cpcItem1, cpcItem2, cpcItem3, cpcItem4, cpcItem5, cpcItem6, cpcItem7, cpcItem8, cpcItem9, cpcItem10);
-}
-
-exec function wo_update3(serverPlayerId : int, id : name, outgoingGwentTo : string, outgoingGwentRequest : E_GwentRequest, outgoingGwentBet : int, outgoingGwentSeed : int, lastGwentAction : string, lastGwentActionTime : float, gwentData : string)
-{
-    theGame.r_getMultiplayerClient().updatePlayerData3(serverPlayerId, id, outgoingGwentTo, outgoingGwentRequest, outgoingGwentBet, outgoingGwentSeed, lastGwentAction, lastGwentActionTime, gwentData);
-}
-
-exec function wo_update4(serverPlayerId : int, id : name, inParty : bool, joinedParty : string, weather : name, day : int, hour : int, minute : int, second : int, lastDialogIndex : int, lastDialogCount : int, dialogChoices : string, 
-                         dialogChoicesActive : bool, armorDye : int, gloveDye : int, pantDye : int, bootDye : int, health : float)
-{
-    theGame.r_getMultiplayerClient().updatePlayerData4(serverPlayerId, id, inParty, joinedParty, weather, day, hour, minute, second, lastDialogIndex , lastDialogCount, dialogChoices, dialogChoicesActive, armorDye, gloveDye, pantDye, bootDye, health);
-}
-
-exec function mpghosts_disconnect(id :string)
-{
-    theGame.r_getMultiplayerClient().disconnect(id);
-    theGame.r_getMultiplayerClient().disconnectGlobal(id);
-}
-
-exec function mpghosts_destroyAll()
-{
-    theGame.r_getMultiplayerClient().destroyAll();
 }
 
 function mpghosts_playerEmote(anim : name, optional noSmooth : bool)
@@ -6878,6 +7218,9 @@ function mpghosts_teleport(user :string)
             }
             else
             {
+                theGame.r_getMultiplayerClient().WO_SetTeleporting(true);
+                theGame.r_getMultiplayerClient().WO_PublishPresence("Teleporting", true);
+
                 theGame.ScheduleWorldChangeToPosition( theGame.GetCommonMapManager().GetWorldPathFromAreaType(players[i].area), players[i].pos, thePlayer.GetWorldRotation() );
             }
             return;
@@ -7166,6 +7509,8 @@ state WO_Tick in r_MultiplayerClient
 	{
         while(true)
         {
+            parent.WO_PumpTransport();
+
             parent.updateCompanionIcons();
 
             if (!parent.getInGame())
