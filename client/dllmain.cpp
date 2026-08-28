@@ -22,8 +22,6 @@
 
 namespace fs = std::filesystem;
 
-static std::thread g_sender;
-static std::thread g_receiver;
 static std::string username = "Player";
 static std::string ip = "46.62.255.79";
 static std::string port = "40000";
@@ -36,6 +34,12 @@ static asio::io_context io;
 static asio::ip::udp::resolver resolver(io);
 static asio::ip::udp::socket theSocket(io);
 static asio::ip::udp::endpoint serverEndpoint;
+
+static bool PinClientModule()
+{
+	HMODULE pinnedModule = nullptr;
+	return GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&PinClientModule), &pinnedModule) != FALSE;
+}
 
 struct ParsedHalves
 {
@@ -960,8 +964,11 @@ static void connectServer()
 		theSocket.connect(serverEndpoint);
 		wo_native::SetConnected(true);
 
-		g_sender = std::thread(SenderThread);
-		g_receiver = std::thread(ReceiverThread);
+		// These workers are process-lifetime. Detaching avoids std::thread global
+		// destruction/join work during DLL_PROCESS_DETACH. The module is pinned, so
+		// their code cannot be unloaded while they are running.
+		std::thread(SenderThread).detach();
+		std::thread(ReceiverThread).detach();
 	}
 	catch (const std::exception &e)
 	{
@@ -1007,29 +1014,11 @@ static void initScript()
 
 	wo_native::SetUsername(username);
 
-	if (!wo_native::ResolveScriptApi())
+	if (!wo_native::RegisterNatives())
 	{
-		wo_native::DebugLog("script API signature resolution failed");
+		wo_native::DebugLog("failed to register WitcherOnline native functions");
 		return;
 	}
-
-	wo_native::DebugLog("script API signature resolution OK");
-
-	if (!wo_native::CanMarshalStrings())
-	{
-		wo_native::DebugLog("script string marshalling resolution failed");
-		return;
-	}
-
-	wo_native::DebugLog("script string marshalling resolution OK");
-
-	if (!wo_native::InstallRegistrationHook())
-	{
-		wo_native::DebugLog("registration hook failed: " + wo_native::RegistrationError());
-		return;
-	}
-
-	wo_native::DebugLog("registration hook installed OK");
 
 	connectServer();
 }
@@ -1038,6 +1027,10 @@ static DWORD WINAPI InitThreadProc(LPVOID)
 {
 	if (g_shutdown.load())
 		return 0;
+
+	// WitcherOnline owns long-lived networking workers. Keep the ASI loaded for
+	// the process lifetime so an ASI loader cannot FreeLibrary it underneath them.
+	PinClientModule();
 
 	initScript();
 	return 0;
@@ -1058,25 +1051,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 		break;
 
 	case DLL_PROCESS_DETACH:
-		g_shutdown.store(true);
-		g_run.store(false);
-		wo_native::SetConnected(false);
-
-		try
-		{
-			if (theSocket.is_open())
-				theSocket.close();
-		}
-		catch (...)
-		{
-		}
-
-		if (g_sender.joinable())
-			g_sender.join();
-		if (g_receiver.joinable())
-			g_receiver.join();
-
-		wo_native::RemoveRegistrationHook();
 		break;
 	}
 

@@ -27,22 +27,18 @@ namespace wo_native
 		std::vector<std::string> fields;
 	};
 
-	void InitLog(const std::string& path);
+	void InitLog(const std::string &path);
 	void ShutdownLog();
-	void DebugLog(const std::string& text);
+	void DebugLog(const std::string &text);
 
-	bool ResolveScriptApi();
-	bool CanMarshalStrings();
-	bool InstallRegistrationHook();
-	void RemoveRegistrationHook();
-	const std::string& RegistrationError();
+	bool RegisterNatives();
 
 	bool IsConnected();
 	void SetConnected(bool connected);
 	void SetLocalId(int id);
-	void SetUsername(const std::string& name);
+	void SetUsername(const std::string &name);
 
-	bool PopOutbound(std::string& payload);
-	void PushInbound(InboundMessage&& message);
+	bool PopOutbound(std::string &payload);
+	void PushInbound(InboundMessage &&message);
 	void PushControl(InboundOpcode opcode);
-}
+} // namespace wo_native
