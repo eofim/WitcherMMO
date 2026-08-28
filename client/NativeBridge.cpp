@@ -120,16 +120,16 @@ namespace wo_native
 		return out;
 	}
 
-	static bool WriteStringResult(void *result, const std::string &text)
+	static bool ReturnString(void *frame, void *result, const std::string &text)
 	{
 		const std::wstring wide(text.begin(), text.end());
-		return WNB_WriteStringResult(result, wide.c_str(), static_cast<uint32_t>(wide.size()));
+		return WNB_ReturnString(frame, result, wide.c_str(), static_cast<uint32_t>(wide.size()));
 	}
 
-	static void WriteNameResult(void *result, const std::string &text)
+	static void ReturnName(void *frame, void *result, const std::string &text)
 	{
 		const std::wstring wide(text.begin(), text.end());
-		WNB_WriteNameResult(result, wide.c_str());
+		WNB_ReturnNameFromString(frame, result, wide.c_str());
 	}
 
 	static const std::string &CurrentField(int index)
@@ -235,14 +235,12 @@ namespace wo_native
 	{
 		WNB_String text{};
 		const int size = WNB_ReadStringParameter(frame, &text);
-		WNB_AdvanceFrame(frame);
 
 		bool queued = false;
 
 		if (!g_connected.load())
 		{
-			if (result)
-				*static_cast<bool *>(result) = false;
+			WNB_ReturnBool(frame, result, false);
 			return;
 		}
 
@@ -270,8 +268,7 @@ namespace wo_native
 			}
 		}
 
-		if (result)
-			*static_cast<bool *>(result) = queued;
+		WNB_ReturnBool(frame, result, queued);
 	}
 
 	static constexpr ULONGLONG kWoTransportIntervalMs = 20;
@@ -324,8 +321,6 @@ namespace wo_native
 
 	static void WO_Tick(void *, void *frame, void *result)
 	{
-		WNB_AdvanceFrame(frame);
-
 		int mask = 0;
 		const bool connected = g_connected.load();
 
@@ -356,13 +351,11 @@ namespace wo_native
 				mask += 16;
 		}
 
-		if (result)
-			*static_cast<int *>(result) = mask;
+		WNB_ReturnInt(frame, result, mask);
 	}
 
 	static void WO_Poll(void *, void *frame, void *result)
 	{
-		WNB_AdvanceFrame(frame);
 		int opcode = -1;
 
 		{
@@ -381,28 +374,26 @@ namespace wo_native
 			}
 		}
 
-		if (result)
-			*static_cast<int *>(result) = opcode;
+		WNB_ReturnInt(frame, result, opcode);
 	}
 
 	static void WO_Str(void *, void *frame, void *result)
 	{
 		const int index = WNB_ReadIntParameter(frame);
-		WNB_AdvanceFrame(frame);
 
 		if (index == -1)
 		{
-			WriteStringResult(result, g_current.sender);
+			ReturnString(frame, result, g_current.sender);
 			return;
 		}
 		if (index == -2)
 		{
-			WriteStringResult(result, std::to_string(g_current.playerId));
+			ReturnString(frame, result, std::to_string(g_current.playerId));
 			return;
 		}
 		if (index == -3)
 		{
-			WriteStringResult(result, std::to_string(g_current.fields.size()));
+			ReturnString(frame, result, std::to_string(g_current.fields.size()));
 			return;
 		}
 		if (index == -4)
@@ -412,7 +403,7 @@ namespace wo_native
 				std::lock_guard<std::mutex> lock(g_stateMutex);
 				localName = g_username;
 			}
-			WriteStringResult(result, localName);
+			ReturnString(frame, result, localName);
 			return;
 		}
 		if (index == -5)
@@ -422,25 +413,24 @@ namespace wo_native
 				std::lock_guard<std::mutex> lock(g_stateMutex);
 				localId = g_localId;
 			}
-			WriteStringResult(result, std::to_string(localId));
+			ReturnString(frame, result, std::to_string(localId));
 			return;
 		}
 
-		WriteStringResult(result, CurrentField(index));
+		ReturnString(frame, result, CurrentField(index));
 	}
 
 	static void WO_NameAt(void *, void *frame, void *result)
 	{
 		const int index = WNB_ReadIntParameter(frame);
-		WNB_AdvanceFrame(frame);
 
 		if (index == -1)
 		{
-			WriteNameResult(result, g_current.sender);
+			ReturnName(frame, result, g_current.sender);
 			return;
 		}
 
-		WriteNameResult(result, CurrentField(index));
+		ReturnName(frame, result, CurrentField(index));
 	}
 
 	bool RegisterNatives()
