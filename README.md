@@ -106,3 +106,8 @@ Join the Discord to report any bugs or issues you encounter with the mod.
 - [Wiki](https://rejuvenate.gitbook.io/witcheronline)
 - [YouTube](https://www.youtube.com/@rejuvenate7/videos)
 - [Donate](https://ko-fi.com/rejuvenate)
+
+## Credits
+- [rejuvenate7](https://github.com/rejuvenate7) - Lead developer
+- [x4lva](https://github.com/x4lva) - Co-developer, Gwent sync
+- [Flawkee](https://github.com/flawkee) - Co-developer, Native hook / NPC sync (in progress)
