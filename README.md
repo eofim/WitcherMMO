@@ -1,113 +1,114 @@
-# Witcher Online
-<div align="left">
-  <a href="https://www.youtube.com/watch?v=E36I77ardm4">
-    <img
-      src="https://github.com/user-attachments/assets/2f2c39ab-7d48-4095-8a89-56fbede324ef"
-    >
-  </a>
-</div>
+# WitcherMMO
 
-**Witcher Online** is a mod that adds multiplayer to *The Witcher 3: Wild Hunt*, turning your single player experience into an MMO experience. Join servers to play with your friends, customize your character using [Custom Player Characters](https://www.nexusmods.com/witcher3/mods/5940) and relax in taverns using [Chill Out](https://www.nexusmods.com/witcher3/mods/6402). Play Gwent and join parties with other players. Chat with strangers and perform emotes to roleplay with other players. Complete quests alongside friends.
+**WitcherMMO** is an experimental open-source project that aims to evolve *The Witcher 3: Wild Hunt* into a more persistent multiplayer RPG experience.
 
-## Getting started
-To play Witcher Online, go to the [nexus page](https://www.nexusmods.com/witcher3/mods/11590).
+This repository is a fork of [WitcherOnline](https://github.com/rejuvenate7/WitcherOnline), created by **rejuvenate7** and contributors. WitcherOnline provides the multiplayer foundation on which WitcherMMO is being developed.
 
-For general information, go to the [Witcher Online Wiki](https://rejuvenate.gitbook.io/witcheronline).
+> [!IMPORTANT]
+> WitcherMMO is at an early development stage. The current codebase starts from the WitcherOnline baseline. Features described as goals or roadmap items below are **not** considered implemented until explicitly marked as such.
 
-Special thanks to Werasik2aa for his [multiplayer implementation](https://github.com/werasik2aa/Witcher3-Multiplayer) which helped a lot.
+## Project direction
 
-## Features / Playguide
+WitcherMMO intends to extend the existing multiplayer foundation toward a persistent shared-world architecture, including:
 
-Full movement, combat, and appearance sync with other players. Perform emotes and send chat to other players using the player menu or in-game console. Morph into various animals, ride horses and boats with other players.
+- Custom player characters instead of requiring every player to be Geralt.
+- Server-side accounts and persistent characters.
+- Character appearance, equipment, inventory and progression persistence.
+- Stable network entity IDs for players, NPCs and monsters.
+- NPC and monster synchronization.
+- Shared monster health and combat state.
+- Server-authoritative gameplay systems where practical.
+- Shared quest and world state.
+- Parties, guilds, trading and social systems.
+- Interest management, channels or instances to control client load.
+- A long-term path toward a persistent MMO-like experience while remaining a mod for *The Witcher 3*.
 
-Sit down at tables and benches using Chill Out and change into any character in the game with Custom Player Characters.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the development plan.
 
-Play Gwent with other players, using the cards in your deck. Play Timed or Normal mode and place bets.
+## Current foundation inherited from WitcherOnline
 
-Play in parties to synchronize time, weather, and dialog choices. NPC sync is **NOT** implemented.
+The upstream WitcherOnline project already provides a substantial multiplayer base, including player synchronization, combat/appearance synchronization, chat, parties, Gwent multiplayer, emotes, player riding, vehicle passengers, item trading and other multiplayer functionality.
 
-This mod is designed to turn *The Witcher 3* into an MMO experience, where you can see other players on the path.
+At the time this fork was created, upstream also explicitly documented that NPC synchronization, quest progress and shared world state were not fully synchronized. WitcherMMO will treat those limitations as engineering milestones rather than hiding them.
 
-[Features](https://rejuvenate.gitbook.io/witcheronline/general-information/features)
+For documentation and usage of the original project:
 
-### MMO Experience
+- [WitcherOnline repository](https://github.com/rejuvenate7/WitcherOnline)
+- [WitcherOnline Wiki](https://rejuvenate.gitbook.io/witcheronline)
+- [WitcherOnline Nexus page](https://www.nexusmods.com/witcher3/mods/11590)
 
-Join the public server to wander the world with lots of other players.
+## Development principles
 
-![MMO Experience](assets/mmo.gif)
+1. **Preserve upstream attribution and history.** WitcherMMO will not remove credit for the work it is built upon.
+2. **Avoid unsafe mass renames.** Internal identifiers such as `WitcherOnlineClient`, `modWitcherOnline` and `WitcherOnline_*` will only be migrated when the affected native/script interfaces are understood and tested.
+3. **Build vertical slices first.** A working character flow is more valuable than many partially implemented MMO systems.
+4. **Separate presentation from authority.** The Witcher 3 client should increasingly represent server state instead of independently deciding persistent shared-world state.
+5. **Do not claim roadmap features as completed.** Documentation should clearly distinguish inherited, implemented, experimental and planned functionality.
 
-### Chill Out
-Sit down in taverns and other locations throughout the world.
+## First milestone — Character System
 
-![Chill Out](assets/chill.gif)
+The first WitcherMMO vertical slice is:
 
-### Party System
-Join a party with other players to synchronize time, weather, and cutscene dialog choices.
+```text
+Account/Login
+    ↓
+Character Select
+    ↓
+Character Creation
+    ↓
+Persistent Character Data
+    ↓
+Spawn Custom Player
+    ↓
+Synchronize Appearance + Equipment
+    ↓
+Other Players See the Same Character
+```
 
-![Party System](assets/world.gif)
+The first implementation work will focus on understanding the existing native/client/script bridge before replacing any upstream naming or behavior.
 
-![Party System 2](assets/party.gif)
+## Repository layout
 
-### Cutscene Sync
-Dialogue choices the party leader chooses are selected for all players in the party.
+The inherited project is broadly divided into:
 
-![Cutscene Sync](assets/dialog.gif)
+```text
+client/   Native multiplayer client
+server/   Multiplayer server
+witcher/  Witcher 3 scripts/mod content
+assets/   Repository media/assets
+```
 
-### Gwent Duels
+This structure will be evolved incrementally rather than rewritten blindly.
 
-Play Gwent with other players, using your own decks.
+## Upstream credits
 
-![Gwent Duels](assets/gwent.gif)
+WitcherMMO is based on **WitcherOnline**.
 
-### Player Riding
+Original credits preserved from the upstream project:
 
-Sit back and relax while other players drive you to your destination.
+- [rejuvenate7](https://github.com/rejuvenate7) — Lead developer
+- [x4lva](https://github.com/x4lva) — Co-developer, Gwent sync
+- [Flawkee](https://github.com/flawkee) — Co-developer, native hook / NPC sync work
+- [Werasik2aa](https://github.com/werasik2aa) — Author of [Witcher3-Multiplayer](https://github.com/werasik2aa/Witcher3-Multiplayer), acknowledged by WitcherOnline as an important earlier multiplayer implementation
 
-![Player Riding](assets/riding.gif)
+Additional attribution and modification notices are documented in [ATTRIBUTION.md](ATTRIBUTION.md).
 
-### Vehicle Passengers
+## WitcherMMO maintainership
 
-Ride horses and boats with other players.
+WitcherMMO fork and MMO-oriented development:
 
-![Vehicle Passengers Horse](assets/horse.gif)
+- [eofim](https://github.com/eofim)
 
-![Vehicle Passengers Boat](assets/boat.gif)
+Contributions should preserve the upstream notices and clearly identify substantial WitcherMMO-specific changes.
 
-### Item Trading
+## License
 
-Trade items with other players, for a price.
+This project remains licensed under the **GNU General Public License v3.0 (GPL-3.0)**, consistent with the upstream WitcherOnline repository. See [LICENSE](LICENSE).
 
-![Item Trading](assets/trading.gif)
+The GPL license file inherited from WitcherOnline has intentionally been kept intact.
 
-### Morphs
+## Disclaimer
 
-Transform into an owl, crow, fox, or cat.
+WitcherMMO is an independent fan-made modding project and is not an official CD PROJEKT RED product. *The Witcher*, *The Witcher 3: Wild Hunt*, related names, characters and trademarks belong to their respective rights holders.
 
-![Morphs](assets/morphs.gif)
-
-### Emotes
-
-50+ player emotes, some using props.
-
-![Emotes](assets/emotes.gif)
-
-Since only other player locations are synced (not quest progress, NPCs, or the world state), everyone can use their own save file safely.
-
-You can still easily do a full playthrough with each other, just make the same dialog choices and complete quests at the same time as one another.
-
-[Playguide](https://rejuvenate.gitbook.io/witcheronline/general-information/playguide)
-
-## Socials
-
-Join the Discord to report any bugs or issues you encounter with the mod.
-
-- [Discord](https://discord.gg/AGXXvGNnH8)
-- [Wolven Workshop](https://discord.com/invite/RzkhYYr7fk) (`#rejuvenate-rock-farm`)
-- [Wiki](https://rejuvenate.gitbook.io/witcheronline)
-- [YouTube](https://www.youtube.com/@rejuvenate7/videos)
-- [Donate](https://ko-fi.com/rejuvenate)
-
-## Credits
-- [rejuvenate7](https://github.com/rejuvenate7) - Lead developer
-- [x4lva](https://github.com/x4lva) - Co-developer, Gwent sync
-- [Flawkee](https://github.com/flawkee) - Co-developer, Native hook / NPC sync (in progress)
+The WitcherMMO name identifies this fork and does not imply endorsement by the WitcherOnline authors or CD PROJEKT RED.
